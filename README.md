@@ -33,6 +33,22 @@ from Valve is redistributed here.
 
 ---
 
+## Step 0 — Get this script
+
+Clone the repo:
+
+```bash
+git clone https://github.com/28allday/steamos-nvidia-installer.git
+cd steamos-nvidia-installer
+```
+
+Or download just the one script:
+
+```bash
+curl -O https://raw.githubusercontent.com/28allday/steamos-nvidia-installer/main/steamos-nvidia-installer.sh
+chmod +x steamos-nvidia-installer.sh
+```
+
 ## Step 1 — Download the official SteamOS recovery image
 
 Get it straight from Valve:
