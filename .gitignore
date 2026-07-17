@@ -1,0 +1,18 @@
+# SteamOS images — huge, and Valve's to distribute, not ours
+*.img
+*.img.bz2
+*.part
+
+# build caches
+.nvidia-usb-work/
+.nvidia-latest-work/
+.nvidia-patch-work/
+.verify-work/
+
+# personal working notes (not part of the released tool)
+ACHIEVEMENTS.md
+HANDOFF.md
+BLACKSCREEN-INVESTIGATION.md
+
+# archived earlier scripts + dev notes — not part of the release
+old/
