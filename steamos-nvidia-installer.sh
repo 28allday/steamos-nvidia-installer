@@ -112,7 +112,9 @@ done
 
 IMG="$(realpath "$IMG")"
 OUT="${IMG%.img}-nvidia-usbinstall.img"
-[[ "$IMG" == *-nvidia*.img ]] && die "Input looks like an already-patched image — start from the clean repair image."
+# match the FILENAME only — the containing dir may itself be called
+# "steamos-nvidia-installer" (the repo clone), which must not trip this guard
+[[ "$(basename "$IMG")" == *-nvidia*.img ]] && die "Input looks like an already-patched image — start from the clean repair image."
 [[ -e "$OUT" ]] && { warn "Removing previous output $OUT"; rm -f "$OUT"; }
 
 [[ -n "$WORKDIR" ]] || WORKDIR="$(dirname "$OUT")/.nvidia-usb-work"
