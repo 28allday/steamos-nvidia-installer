@@ -50,6 +50,11 @@
 # Options:
 #   --hold-updates     Hard-hold OS updates instead of self-healing (Steam
 #                      always shows "up to date").
+#   --driver PREF      Self-heal driver preference: pinned (default, this
+#                      image's exact driver first), latest (newest Arch
+#                      driver first), or a branch prefix like 595 or 610.
+#                      Fallback chain pref -> latest -> known-good means an
+#                      OS update can never ship a driverless slot.
 #   --no-hold-updates  Stock update behaviour — DANGER: an OS update boots an
 #                      unpatched system (A/B fallback saves you, driver lost).
 #   --no-installer     Skip step 4 (produce a plain bootable patched OS).
@@ -73,6 +78,7 @@ die()  { printf '\e[1;31m[fail]\e[0m %s\n' "$*" >&2; exit 1; }
 
 # ------------------------------------------------------------------- args
 UPDATE_MODE=selfheal   # selfheal | hold | stock
+DRIVER_PREF=pinned     # pinned | latest | branch prefix like 595 / 610
 ADD_INSTALLER=1
 TRIM_CUDA=0
 SKIP_SIG=0
@@ -85,9 +91,10 @@ while [[ $# -gt 0 ]]; do
     --no-hold-updates) UPDATE_MODE=stock ;;
     --no-installer)    ADD_INSTALLER=0 ;;
     --trim-cuda)       TRIM_CUDA=1 ;;
+    --driver)          DRIVER_PREF="${2:?--driver needs pinned|latest|a prefix like 595}"; shift ;;
     --skip-sigcheck)   SKIP_SIG=1 ;;
     --workdir)         WORKDIR="${2:?--workdir needs an argument}"; shift ;;
-    -h|--help)         sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)         sed -n '2,71p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)                die "Unknown option: $1" ;;
     *)                 IMG="$1" ;;
   esac
@@ -476,9 +483,12 @@ if [[ $UPDATE_MODE == selfheal ]]; then
   # the slot's frozen repo, which is what the valve-driver variant does)
   cat > "$MNT/usr/lib/steamos-nvidia/driver.conf" <<EOF
 # Written by steamos-nvidia-installer at image build time.
-# repatch.sh installs the driver from these pinned URLs; to move to a newer
-# driver later, rebuild the USB image with the latest script and reinstall
-# (or update this file by hand with matching-version package URLs).
+# DRIVER_PREF: pinned = this image's exact driver set first; latest = newest
+#   Arch driver first; a branch prefix like 595 or 610 = newest of that
+#   branch first. Whatever the preference, repatch falls down the chain
+#   (pref -> latest -> this known-good floor), so an OS update can never
+#   ship a driverless slot just because one candidate fails to build.
+DRIVER_PREF="$DRIVER_PREF"
 DRIVER_VERSION="$DRIVER_VERSION"
 PKG_URLS="$PKG_URLS"
 EOF
@@ -541,8 +551,9 @@ done
 [[ -n "$KVER" ]] || die "no neptune kernel in $PARTSET rootfs"
 log "Target kernel: $KVER"
 
-if compgen -G "$NEWROOT/usr/lib/modules/$KVER/updates/dkms/nvidia.ko*" >/dev/null; then
-  log "Driver already present for $KVER — nothing to do"
+FORCE="${2:-}"
+if [[ "$FORCE" != force ]] && compgen -G "$NEWROOT/usr/lib/modules/$KVER/updates/dkms/nvidia.ko*" >/dev/null; then
+  log "Driver already present for $KVER — nothing to do (pass 'force' to rebuild anyway)"
   [[ $WAS_RO -eq 1 ]] && btrfs property set "$NEWROOT" ro true
   exit 0
 fi
@@ -579,30 +590,110 @@ in_chroot "curl -sfL '$HDR_URL' -o /tmp/headers.pkg.tar.zst"
 in_chroot "pacman -Sy"
 in_chroot "pacman -Qq" | LC_ALL=C sort > "$WORK/before.txt"
 in_chroot "pacman -U --noconfirm --needed /tmp/headers.pkg.tar.zst"
-in_chroot "pacman -S --noconfirm --needed dkms"
+in_chroot "pacman -S --noconfirm --needed dkms binutils"
 
-# Driver = the exact pinned Arch packages this image was built with (NOT the
-# slot's frozen repo — that only has Valve's older driver).
+# ---------------- driver selection: preference -> latest -> known-good floor
+# DRIVER_PREF (driver.conf): "pinned" = floor first; "latest" = newest Arch
+# driver first; a prefix like "595" or "610" = newest matching that branch
+# first. Whatever fails, the next candidate is tried — an update is only
+# cancelled if EVERY candidate fails to gate+build for this kernel. This is
+# what lets a pinned older driver survive a jump to main/beta kernels.
 source /usr/lib/steamos-nvidia/driver.conf
 [[ -n "${PKG_URLS:-}" ]] || die "driver.conf has no PKG_URLS"
-log "Installing pinned driver $DRIVER_VERSION"
-in_chroot "mkdir -p /tmp/nvpkgs"
-for u in $PKG_URLS; do
-  in_chroot "curl -sfL '$u' -o /tmp/nvpkgs/\$(basename '$u')" || die "download failed: $u"
-done
-if ! in_chroot "pacman -U --noconfirm --needed /tmp/nvpkgs/*.pkg.tar.zst"; then
-  # unattended context: a keyring mismatch (frozen image keyring vs current
-  # Arch packager keys) must not brick updates — packages came over HTTPS
-  # from Arch infrastructure, so retry unsigned rather than fail the update
-  log "WARNING: pacman -U failed (keyring?) — retrying with signature checks off"
-  sed 's/^SigLevel.*/SigLevel = Never/' "$MERGED/etc/pacman.conf" > "$MERGED/tmp/pacman-nosig.conf"
-  in_chroot "pacman --config /tmp/pacman-nosig.conf -U --noconfirm --needed /tmp/nvpkgs/*.pkg.tar.zst" \
-    || die "driver package install failed"
+DRIVER_PREF="${DRIVER_PREF:-pinned}"
+ARCHIVE=https://archive.archlinux.org/packages
+EGL_URL=""; for u in $PKG_URLS; do case "$u" in *egl-wayland*) EGL_URL="$u" ;; esac; done
+
+resolve_set() {  # $1 = version prefix ("" = newest). echoes "ver url..." or fails
+  local pre="$1" p f pv ver="" urls=""
+  for p in nvidia-open-dkms nvidia-utils lib32-nvidia-utils; do
+    f="$(curl -sfL "$ARCHIVE/${p:0:1}/$p/" \
+        | grep -oE "$p-${pre//./\\.}[0-9a-z.]*-[0-9]+-x86_64\.pkg\.tar\.zst" \
+        | grep -v '\.sig' | LC_ALL=C sort -uV | tail -1)" || true
+    [[ -n "$f" ]] || return 1
+    if [[ "$p" == nvidia-utils ]]; then
+      ver="${f#nvidia-utils-}"; ver="${ver%-x86_64*}"
+    else
+      # all nvidia pkgs must share nvidia-utils' pkgver (skip mid-bump skew)
+      pv="${ver%-*}"; [[ -z "$ver" || "$f" == *"$pv"* ]] || return 1
+    fi
+    urls+="${urls:+ }$ARCHIVE/${p:0:1}/$p/$f"
+  done
+  [[ -n "$EGL_URL" ]] && urls+=" $EGL_URL"
+  echo "$ver $urls"
+}
+
+# glibc gate: refuse a payload needing newer glibc than the slot ships (the
+# module never links glibc — Arch-compiled userspace like egl-wayland2 does,
+# and a passing build with broken userspace would be a silent black screen).
+cat > "$MERGED/tmp/gate.sh" <<'GATE'
+#!/bin/bash
+set -e
+command -v readelf >/dev/null || { echo "no-readelf"; exit 1; }
+rm -rf /tmp/gs; mkdir -p /tmp/gs
+for f in /tmp/nvpkgs/*.pkg.tar.zst; do tar -xf "$f" -C /tmp/gs; done
+img="$(pacman -Q glibc | awk '{print $2}' | grep -oE '^[0-9]+\.[0-9]+')"
+max="$({ find /tmp/gs -type f \( -name '*.so*' -o -perm -111 \) \
+       -exec readelf -V {} + 2>/dev/null || true; } \
+     | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+rm -rf /tmp/gs
+echo "needs ${max:-none}, image has ${img:-unknown}"
+[ -n "$img" ] || exit 1
+[ -z "$max" ] && exit 0
+[ "$(printf '%s\n%s\n' "$max" "$img" | sort -V | tail -1)" = "$img" ]
+GATE
+
+try_driver() {  # $1 = space-separated pkg urls; 0 only if nvidia.ko built
+  local urls="$1" u gout
+  in_chroot "rm -rf /tmp/nvpkgs && mkdir -p /tmp/nvpkgs"
+  for u in $urls; do
+    in_chroot "curl -sfL '$u' -o /tmp/nvpkgs/\$(basename '$u')" \
+      || { log "  download failed: $u"; return 1; }
+  done
+  if ! gout="$(in_chroot 'bash /tmp/gate.sh')"; then
+    log "  glibc gate REJECT ($gout) — would break userspace on this image"
+    return 1
+  fi
+  log "  glibc gate ok ($gout)"
+  if ! in_chroot "pacman -U --noconfirm --needed /tmp/nvpkgs/*.pkg.tar.zst"; then
+    # unattended: keyring skew must not kill updates; pkgs came over HTTPS
+    # from Arch infrastructure, so retry unsigned rather than fail
+    log "  pacman -U failed (keyring?) — retrying with signature checks off"
+    sed 's/^SigLevel.*/SigLevel = Never/' "$MERGED/etc/pacman.conf" > "$MERGED/tmp/pacman-nosig.conf"
+    in_chroot "pacman --config /tmp/pacman-nosig.conf -U --noconfirm --needed /tmp/nvpkgs/*.pkg.tar.zst" \
+      || { log "  package install failed"; return 1; }
+  fi
+  in_chroot "dkms autoinstall -k $KVER" || true
+  compgen -G "$MERGED/usr/lib/modules/$KVER/updates/dkms/nvidia.ko*" >/dev/null
+}
+
+S_LATEST=""; s="$(resolve_set "")" && S_LATEST="$s" \
+  || log "WARNING: cannot reach the Arch archive — only the pinned floor is available"
+S_PREF=""
+if [[ "$DRIVER_PREF" != pinned && "$DRIVER_PREF" != latest ]]; then
+  s="$(resolve_set "$DRIVER_PREF")" && S_PREF="$s" \
+    || log "WARNING: no '$DRIVER_PREF' driver in the Arch archive"
 fi
-compgen -G "$MERGED/usr/lib/modules/$KVER/updates/dkms/nvidia.ko*" >/dev/null \
-  || in_chroot "dkms autoinstall -k $KVER"
-compgen -G "$MERGED/usr/lib/modules/$KVER/updates/dkms/nvidia.ko*" >/dev/null \
-  || die "driver failed to build for $KVER"
+CANDS=()
+addc() { [[ -n "$2" ]] && CANDS+=("$1 ${2%% *}|${2#* }"); return 0; }
+case "$DRIVER_PREF" in
+  pinned) CANDS+=("pinned-floor $DRIVER_VERSION|$PKG_URLS"); addc latest "$S_LATEST" ;;
+  latest) addc latest "$S_LATEST"; CANDS+=("known-good-floor $DRIVER_VERSION|$PKG_URLS") ;;
+  *)      addc "preferred($DRIVER_PREF)" "$S_PREF"; addc latest "$S_LATEST"
+          CANDS+=("known-good-floor $DRIVER_VERSION|$PKG_URLS") ;;
+esac
+INSTALLED=""; INSTALLED_URLS=""; SEEN=" "
+for c in "${CANDS[@]}"; do
+  clabel="${c%%|*}"; curls="${c#*|}"; ckey="${curls%% *}"
+  [[ "$SEEN" == *" $ckey "* ]] && continue
+  SEEN+="$ckey "
+  log "Trying driver: $clabel"
+  if try_driver "$curls"; then INSTALLED="$clabel"; INSTALLED_URLS="$curls"; break; fi
+  log "  $clabel did not produce a module — trying next candidate"
+done
+[[ -n "$INSTALLED" ]] || die "driver failed to build for $KVER (every candidate tried)"
+INSTALLED_VER="${INSTALLED##* }"
+log "Driver installed: $INSTALLED"
 in_chroot "pacman -Qq" | LC_ALL=C sort > "$WORK/after.txt"
 
 BUILD_ONLY_RE='^(dkms|nvidia-open-dkms|patch|gcc|gcc-libs|make|binutils|libisl|libmpc|mpfr|pahole|python-setuptools|linux-neptune.*-headers|.*-headers)$'
@@ -642,6 +733,26 @@ grep -q 'rd.driver.blacklist=nouveau' "$NEWROOT/etc/default/grub" \
 # NEXT update is covered too
 mkdir -p "$NEWROOT/usr/lib/steamos-nvidia"
 cp -a /usr/lib/steamos-nvidia/. "$NEWROOT/usr/lib/steamos-nvidia/"
+# advance the known-good floor to the driver set that actually built now,
+# keeping the user's preference — the fallback always tracks a proven set
+cat > "$NEWROOT/usr/lib/steamos-nvidia/driver.conf" <<EOF2
+# steamos-nvidia driver.conf (rewritten by repatch after a successful build).
+# DRIVER_PREF: pinned | latest | version prefix (e.g. 595, 610).
+# DRIVER_VERSION/PKG_URLS: last driver set that installed AND built cleanly —
+# the guaranteed fallback if the preferred/newest driver can't build.
+DRIVER_PREF="$DRIVER_PREF"
+DRIVER_VERSION="$INSTALLED_VER"
+PKG_URLS="$INSTALLED_URLS"
+EOF2
+# re-arm the boot failsafe inside the new slot (unit lives in /etc, which the
+# update wiped — the keep-list preserves it on the CURRENT slot, this covers
+# the freshly staged one)
+if [[ -f /usr/lib/steamos-nvidia/failsafe.service ]]; then
+  install -d "$NEWROOT/etc/systemd/system/multi-user.target.wants" "$NEWROOT/etc/atomic-update.conf.d"
+  install -m644 /usr/lib/steamos-nvidia/failsafe.service "$NEWROOT/etc/systemd/system/steamos-nvidia-failsafe.service"
+  ln -sf ../steamos-nvidia-failsafe.service "$NEWROOT/etc/systemd/system/multi-user.target.wants/steamos-nvidia-failsafe.service"
+  install -m644 /usr/lib/steamos-nvidia/keep.conf "$NEWROOT/etc/atomic-update.conf.d/steamos-nvidia.conf"
+fi
 if [[ ! -f "$NEWROOT/usr/bin/steamos-update.orig" ]]; then
   mv "$NEWROOT/usr/bin/steamos-update" "$NEWROOT/usr/bin/steamos-update.orig"
   cp -a /usr/bin/steamos-update "$NEWROOT/usr/bin/steamos-update"
@@ -666,9 +777,85 @@ log "Syncing"
 btrfs filesystem sync "$NEWROOT"
 sync -f "$NEWROOT"
 [[ $WAS_RO -eq 1 ]] && btrfs property set "$NEWROOT" ro true
-log "OK — $PARTSET is NVIDIA-ready ($KVER)"
+log "OK — $PARTSET is NVIDIA-ready ($KVER) on: $INSTALLED"
 REPATCH
   chmod 755 "$MNT/usr/lib/steamos-nvidia/repatch.sh"
+
+  # ---- boot failsafe: if a slot ever boots driverless, verify the other
+  # ---- slot has a driver, flip back to it once, never loop
+  cat > "$MNT/usr/lib/steamos-nvidia/failsafe.sh" <<'FAILSAFE'
+#!/bin/bash
+# steamos-nvidia boot failsafe — last net under the update machinery.
+# If this boot has no NVIDIA driver (dead panel on a muxed laptop), verify the
+# OTHER slot is driver-ready and flip back to it. One-shot stamp on /home
+# guarantees no bootloop; if there is nowhere safe to go, start sshd and stay
+# up for recovery instead. Never touches boot configs on a healthy boot.
+set -uo pipefail
+STAMP=/home/.steamos-nvidia-failsafe
+log(){ echo "[nvidia-failsafe] $*"; }
+
+modprobe nvidia 2>/dev/null || true
+if [[ -d /sys/module/nvidia ]]; then rm -f "$STAMP"; exit 0; fi
+
+log "NO NVIDIA DRIVER on this boot ($(uname -r))"
+systemctl start sshd 2>/dev/null || true
+
+if [[ -f "$STAMP" ]]; then
+  log "already flipped once ($(cat "$STAMP" 2>/dev/null)) — staying up for recovery (sshd started)"
+  exit 0
+fi
+
+OTHER=/dev/disk/by-partsets/other/rootfs
+[[ -b "$OTHER" ]] || { log "no other slot — staying up"; exit 0; }
+M="$(mktemp -d)"; ok=0
+if mount -o ro "$OTHER" "$M" 2>/dev/null; then
+  for d in "$M/usr/lib/modules/"*neptune*; do
+    [[ -d "$d" ]] || continue
+    compgen -G "$d/updates/dkms/nvidia.ko*" >/dev/null && ok=1 && break
+  done
+  umount "$M" 2>/dev/null
+fi
+rmdir "$M" 2>/dev/null
+[[ $ok -eq 1 ]] || { log "other slot has no driver either — staying up (sshd started)"; exit 0; }
+
+THIS="$(steamos-bootconf this-image 2>/dev/null)" || THIS=""
+[[ -n "$THIS" ]] || { log "cannot identify booted image — staying up"; exit 0; }
+date "+flipped away from $THIS at %F %T" > "$STAMP"; sync
+log "other slot IS driver-ready — marking $THIS invalid, rebooting to the working slot"
+for conf in /esp/SteamOS/conf/*.conf; do
+  [[ -f "$conf" ]] || continue
+  [[ "$(basename "$conf" .conf)" == "$THIS" ]] || continue
+  sed -i -e 's/^boot-requested-at:.*/boot-requested-at: 0/' \
+         -e 's/^boot-attempts:.*/boot-attempts: 0/' \
+         -e 's/^image-invalid:.*/image-invalid: 1/' "$conf"
+done
+sync -f /esp/SteamOS/conf 2>/dev/null || sync
+systemctl reboot
+FAILSAFE
+  chmod 755 "$MNT/usr/lib/steamos-nvidia/failsafe.sh"
+  cat > "$MNT/usr/lib/steamos-nvidia/failsafe.service" <<'FSUNIT'
+[Unit]
+Description=NVIDIA driver boot failsafe (revert to the other slot if this boot is driverless)
+After=multi-user.target local-fs.target
+ConditionPathExists=/usr/lib/steamos-nvidia/failsafe.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/steamos-nvidia/failsafe.sh
+
+[Install]
+WantedBy=multi-user.target
+FSUNIT
+  cat > "$MNT/usr/lib/steamos-nvidia/keep.conf" <<'FSKEEP'
+/etc/systemd/system/steamos-nvidia-failsafe.service
+/etc/systemd/system/multi-user.target.wants/steamos-nvidia-failsafe.service
+/etc/atomic-update.conf.d/steamos-nvidia.conf
+/etc/modprobe.d/99-nvidia-patch.conf
+FSKEEP
+  install -d "$MNT/etc/systemd/system/multi-user.target.wants" "$MNT/etc/atomic-update.conf.d"
+  install -m644 "$MNT/usr/lib/steamos-nvidia/failsafe.service" "$MNT/etc/systemd/system/steamos-nvidia-failsafe.service"
+  ln -sf ../steamos-nvidia-failsafe.service "$MNT/etc/systemd/system/multi-user.target.wants/steamos-nvidia-failsafe.service"
+  install -m644 "$MNT/usr/lib/steamos-nvidia/keep.conf" "$MNT/etc/atomic-update.conf.d/steamos-nvidia.conf"
 
   # ---- wrapper around steamos-update: real update, then repatch the new slot
   if [[ ! -f "$MNT/usr/bin/steamos-update.orig" ]]; then
@@ -882,6 +1069,9 @@ if [[ $UPDATE_MODE == selfheal ]]; then
   [[ -f "$MNT/usr/bin/steamos-update.orig" ]] || die "original steamos-update not preserved"
   grep -q 'repatch' "$MNT/usr/lib/steamos-nvidia/repatch.sh" || die "repatch tool missing"
   grep -q "^DRIVER_VERSION=\"$DRIVER_VERSION\"" "$MNT/usr/lib/steamos-nvidia/driver.conf" || die "driver.conf missing/wrong"
+  grep -q "^DRIVER_PREF=\"$DRIVER_PREF\"" "$MNT/usr/lib/steamos-nvidia/driver.conf" || die "driver.conf missing DRIVER_PREF"
+  [[ -x "$MNT/usr/lib/steamos-nvidia/failsafe.sh" ]] || die "failsafe.sh missing"
+  [[ -L "$MNT/etc/systemd/system/multi-user.target.wants/steamos-nvidia-failsafe.service" ]] || die "failsafe not enabled"
   [[ -L "$MNT/etc/systemd/system/atomupd.service" ]] && die "atomupd must NOT be masked in selfheal mode"
 fi
 compgen -G "$MNT/usr/lib/firmware/nvidia/*/gsp_*.bin" >/dev/null || warn "GSP firmware not found — nvidia-open needs it"

@@ -118,7 +118,13 @@ system — it fails safe.
 
 To move to a **newer driver** later, rebuild the USB image with an updated
 copy of this script (it re-resolves the latest driver each run) and
-reinstall using the **Upgrade** icon.
+reinstall using the **Upgrade** icon. You can also let the installed system
+follow newer drivers on its own with `--driver` (below).
+
+If a slot ever does boot without a driver anyway, a boot failsafe checks
+whether the *other* slot still has a working module and, if so, marks this
+one invalid and reboots back to it — once only, so it can never bootloop.
+With nowhere safe to go it starts `sshd` and stays up for recovery.
 
 Alternative update modes at build time:
 
@@ -132,6 +138,11 @@ Alternative update modes at build time:
 
 ```
 --hold-updates     Hard-hold OS updates instead of self-healing.
+--driver PREF      Which driver a self-heal reaches for: pinned (default,
+                   this image's exact driver), latest (newest Arch driver),
+                   or a branch prefix like 595 / 610. Always falls back
+                   through latest to the last known-good set, so an OS
+                   update can never leave a slot driverless.
 --no-hold-updates  Stock update behaviour (driver lost on update!).
 --no-installer     Skip the desktop installer — just a bootable patched OS.
 --trim-cuda        Drop CUDA/OpenCL/OptiX libraries (~350 MB smaller).
