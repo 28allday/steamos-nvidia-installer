@@ -3,13 +3,14 @@
 # steamos-nvidia-installer.sh — turn a CLEAN SteamOS OOBE repair image into a
 # one-click USB installer with NVIDIA (RTX) driver support baked in.
 #
-# Installs the CURRENT Arch Linux nvidia-open driver (Valve's own mirror only
-# pins an older 575.x). The version is resolved once at build time, pinned to
+# Installs the CURRENT Arch Linux nvidia-open driver by default (Valve's own
+# mirror only pins an older 575.x) — or any branch you name with --driver.
+# The version is resolved once at build time, pinned to
 # permanent archive.archlinux.org URLs, and the on-device self-heal repatch
 # reuses those exact packages, so the installed system stays on one known
 # driver even across OS updates. Safety: NVIDIA's userspace
-# blobs target ancient glibc, and the single Arch-compiled helper the new
-# driver needs (egl-wayland2) is small — but the build still extracts every
+# blobs target ancient glibc, and the Arch-compiled helpers the newer
+# drivers need (egl-wayland2) are small — but the build still extracts every
 # downloaded package and verifies no binary needs a newer glibc than the
 # image ships (frozen SteamOS 3.8 = glibc 2.41; current Arch = 2.43, so
 # blind installs of Arch-compiled libs are NOT safe in general).
@@ -48,6 +49,12 @@
 #      system once you set a password).
 #
 # Options:
+#   --driver SPEC      Which NVIDIA driver to install. "latest" (default) =
+#                      whatever current Arch ships. Otherwise a branch or
+#                      version prefix — 580, 580.105.08, 580.105.08-4 — and
+#                      the newest matching build is taken from the Arch
+#                      archive. SteamOS itself ships 575.x; nvidia-open
+#                      needs Turing (RTX 20xx) or newer whichever you pick.
 #   --hold-updates     Hard-hold OS updates instead of self-healing (Steam
 #                      always shows "up to date").
 #   --no-hold-updates  Stock update behaviour — DANGER: an OS update boots an
@@ -76,18 +83,20 @@ UPDATE_MODE=selfheal   # selfheal | hold | stock
 ADD_INSTALLER=1
 TRIM_CUDA=0
 SKIP_SIG=0
+DRIVER_SPEC=latest     # latest | <branch or version prefix, e.g. 580>
 WORKDIR=""
 IMG=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --driver)          DRIVER_SPEC="${2:?--driver needs an argument}"; shift ;;
     --hold-updates)    UPDATE_MODE=hold ;;
     --no-hold-updates) UPDATE_MODE=stock ;;
     --no-installer)    ADD_INSTALLER=0 ;;
     --trim-cuda)       TRIM_CUDA=1 ;;
     --skip-sigcheck)   SKIP_SIG=1 ;;
     --workdir)         WORKDIR="${2:?--workdir needs an argument}"; shift ;;
-    -h|--help)         sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)         sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)                die "Unknown option: $1" ;;
     *)                 IMG="$1" ;;
   esac
@@ -95,6 +104,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $EUID -eq 0 ]] || die "Run as root (sudo)."
+[[ "$DRIVER_SPEC" == latest || "$DRIVER_SPEC" =~ ^[0-9]+(\.[0-9]+)*(-[0-9]+)?$ ]] \
+  || die "--driver takes 'latest' or a version prefix like 580 / 580.105.08 / 580.105.08-4"
 if [[ -z "$IMG" ]]; then
   # No image given — look for exactly one clean repair image next to the script.
   script_dir="$(dirname "$(realpath "$0")")"
@@ -231,55 +242,111 @@ curl -sfIL "$HDR_URL" -o /dev/null \
   || die "Exact-match headers not found in Valve's pool: $HDR_URL"
 log "Headers package: $(basename "$HDR_URL")"
 
-# ------------------------------------- resolve latest Arch driver packages
-# The driver set comes from CURRENT Arch, not Valve's frozen mirror. Version
-# is resolved here once, then pinned via permanent archive.archlinux.org
-# URLs (mirror URLs die when Arch bumps the version) — the same URLs are
-# recorded in the image for the self-heal repatch.
-log "Resolving latest NVIDIA driver from Arch Linux"
+# -------------------------------------------- resolve the driver packages
+# The driver set comes from Arch, not Valve's frozen mirror (which pins an
+# older 575.x). Default is whatever current Arch ships; --driver <branch>
+# takes the newest build of that branch out of the Arch archive instead.
+# Either way the resolved URLs are pinned to permanent
+# archive.archlinux.org paths (mirror URLs die when Arch bumps the version)
+# — the same URLs are recorded in the image for the self-heal repatch.
+ARCHIVE_URL=https://archive.archlinux.org/packages
+
 PKG_URLS=""            # pinned URLs, space-separated (also goes in driver.conf)
+PKG_URL_ARR=()         # same, indexable alongside PKG_FILES
 PKG_FILES=()           # local filenames in $WORKDIR/pkgs
+FETCHED=0              # how many of PKG_FILES are already downloaded
 DRIVER_VERSION=""      # nvidia-utils pkgver-pkgrel
 NV_PKGVER=""           # pkgver only, for cross-package consistency check
-for spec in extra/nvidia-open-dkms extra/nvidia-utils multilib/lib32-nvidia-utils extra/egl-wayland2; do
-  repo="${spec%/*}"; pkg="${spec#*/}"
-  line="$(curl -sfL "https://archlinux.org/packages/$repo/x86_64/$pkg/json/" \
-          | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["pkgver"]+"-"+d["pkgrel"], d["filename"])')" \
-    || die "Could not resolve $pkg from archlinux.org"
-  ver="${line%% *}"; file="${line#* }"
-  [[ "$pkg" == nvidia-utils ]] && { DRIVER_VERSION="$ver"; NV_PKGVER="${ver%-*}"; }
-  url="https://archive.archlinux.org/packages/${pkg:0:1}/$pkg/$file"
-  if ! curl -sfIL "$url" -o /dev/null; then
-    url="https://geo.mirror.pkgbuild.com/$repo/os/x86_64/$file"
-    curl -sfIL "$url" -o /dev/null || die "$pkg $ver not on archive.archlinux.org nor the mirror"
-    warn "$pkg not yet in the Arch archive — pinning mirror URL (may go stale)"
+PIN_VER=""             # version pin_pkg just resolved
+
+# pin_pkg <pkg> <spec> — resolve one package and add it to the pinned set.
+# spec "latest" = what current Arch has (archive URL when it's there yet,
+# else the mirror); anything else = newest archived build whose version
+# starts with that prefix ("580", "580.105.08", "580.105.08-4").
+pin_pkg() {
+  local pkg="$1" spec="$2" repo ver file url
+  if [[ "$spec" == latest ]]; then
+    read -r ver file repo < <(curl -sfL "https://archlinux.org/packages/search/json/?name=$pkg" \
+      | python3 -c 'import json,sys
+r=[p for p in json.load(sys.stdin)["results"]
+   if p["repo"] in ("core","extra","multilib") and p["arch"] == "x86_64"]
+if not r: raise SystemExit(1)
+p=r[0]; print(p["pkgver"]+"-"+str(p["pkgrel"]), p["filename"], p["repo"])') \
+      || die "Could not resolve $pkg from archlinux.org"
+    url="$ARCHIVE_URL/${pkg:0:1}/$pkg/$file"
+    if ! curl -sfIL "$url" -o /dev/null; then
+      url="https://geo.mirror.pkgbuild.com/$repo/os/x86_64/$file"
+      curl -sfIL "$url" -o /dev/null || die "$pkg $ver not on archive.archlinux.org nor the mirror"
+      warn "$pkg not yet in the Arch archive — pinning mirror URL (may go stale)"
+    fi
+  else
+    # the archive keeps every build ever released; newest match wins
+    file="$(curl -sfL "$ARCHIVE_URL/${pkg:0:1}/$pkg/" \
+            | grep -oE "${pkg}-${spec}[.-][^\"<]*-x86_64\.pkg\.tar\.zst" | sort -uV | tail -1 || true)"
+    [[ -n "$file" ]] || die "No $pkg build matching '$spec' in the Arch archive (bad --driver value, or no network)"
+    ver="${file#"$pkg"-}"; ver="${ver%-x86_64.pkg.tar.zst}"
+    url="$ARCHIVE_URL/${pkg:0:1}/$pkg/$file"
   fi
   PKG_URLS+="${PKG_URLS:+ }$url"
+  PKG_URL_ARR+=("$url")
   PKG_FILES+=("$file")
+  PIN_VER="$ver"
   log "  $pkg $ver"
-done
-# all three nvidia packages must be the same driver release (mirror mid-bump
-# skew would make pacman -U fail on the versioned dependency)
-for f in "${PKG_FILES[@]}"; do
-  case "$f" in
-    nvidia-open-dkms-*|lib32-nvidia-utils-*)
-      [[ "$f" == *"$NV_PKGVER"* ]] || die "Version skew between nvidia packages (mirror mid-update?) — retry in an hour" ;;
-  esac
-done
+}
+
+# fetch_pins — download whatever pin_pkg has added since the last call
+fetch_pins() {
+  mkdir -p "$WORKDIR/pkgs"
+  local i f
+  for (( i=FETCHED; i<${#PKG_FILES[@]}; i++ )); do
+    f="${PKG_FILES[$i]}"
+    if [[ -s "$WORKDIR/pkgs/$f" ]]; then
+      log "Cached: $f"
+    else
+      log "Downloading $f"
+      curl -sfL "${PKG_URL_ARR[$i]}" -o "$WORKDIR/pkgs/$f.part" \
+        || die "download failed: ${PKG_URL_ARR[$i]}"
+      mv "$WORKDIR/pkgs/$f.part" "$WORKDIR/pkgs/$f"
+    fi
+  done
+  FETCHED=${#PKG_FILES[@]}
+}
+
+log "Resolving NVIDIA driver packages from Arch Linux (--driver $DRIVER_SPEC)"
+pin_pkg nvidia-utils "$DRIVER_SPEC"
+DRIVER_VERSION="$PIN_VER"; NV_PKGVER="${PIN_VER%-*}"
 log "Driver pinned: nvidia-open $DRIVER_VERSION"
 
-mkdir -p "$WORKDIR/pkgs"
-i=0
-for url in $PKG_URLS; do
-  f="${PKG_FILES[$i]}"; i=$((i+1))
-  if [[ -s "$WORKDIR/pkgs/$f" ]]; then
-    log "Cached: $f"
-  else
-    log "Downloading $f"
-    curl -sfL "$url" -o "$WORKDIR/pkgs/$f.part" || die "download failed: $url"
-    mv "$WORKDIR/pkgs/$f.part" "$WORKDIR/pkgs/$f"
-  fi
+# Fetch nvidia-utils first: its own dependency list decides which support
+# packages have to come from Arch too — egl-wayland2 only became a
+# dependency at 590, so pulling it in for older branches would be wrong.
+fetch_pins
+
+# Module source + 32-bit userspace must match nvidia-utils exactly. On
+# "latest" they're resolved the same way (a just-bumped package may not be
+# in the archive yet); the skew check catches a mirror caught mid-bump.
+COMPANION_SPEC="$DRIVER_SPEC"
+[[ "$COMPANION_SPEC" == latest ]] || COMPANION_SPEC="$NV_PKGVER"
+for pkg in nvidia-open-dkms lib32-nvidia-utils; do
+  pin_pkg "$pkg" "$COMPANION_SPEC"
+  [[ "$PIN_VER" == "$NV_PKGVER"-* ]] \
+    || die "Version skew: $pkg is $PIN_VER but nvidia-utils is $DRIVER_VERSION (mirror mid-update?) — retry in an hour"
 done
+
+# ...plus the support packages Valve's frozen repo doesn't carry at all, so
+# they can only come from Arch. Every other nvidia-utils dependency
+# (libglvnd, egl-wayland, egl-gbm, egl-x11) is resolved inside the build
+# chroot from Valve's own mirror, which keeps the image self-consistent —
+# don't add them here. egl-wayland2 only became a dependency at branch 590,
+# so which of these apply depends on the driver actually chosen.
+ARCH_ONLY_DEPS=" egl-wayland2 "
+while read -r dep; do
+  [[ -n "$dep" && "$ARCH_ONLY_DEPS" == *" $dep "* ]] || continue
+  log "  $DRIVER_VERSION also needs $dep, which Valve's repo predates"
+  pin_pkg "$dep" latest
+done < <(tar -xOf "$WORKDIR/pkgs/${PKG_FILES[0]}" .PKGINFO \
+         | awk '$1 == "depend" { print $3 }' | sed 's/[<>=].*//')
+fetch_pins
 
 # ---------------------------------------------------- glibc compatibility
 # Current Arch compiles against a newer glibc than frozen SteamOS ships.
@@ -309,6 +376,20 @@ log "OK: payload needs at most glibc $MAX_GLIBC (image has $IMG_GLIBC)"
 rm -rf "$SCAN"
 
 # --------------------------------------------------------- overlay chroot
+# A cached overlay from a previous run of a DIFFERENT driver version has to
+# go: pacman would happily downgrade in place, but the old version's stray
+# files and modules would ride along into the image. (The package cache in
+# $WORKDIR/pkgs is kept — only the build residue is thrown away.)
+if compgen -G "$UPPER/usr/lib/holo/pacmandb/local/nvidia-utils-[0-9]*" >/dev/null; then
+  CACHED_VER="$(basename "$(echo "$UPPER"/usr/lib/holo/pacmandb/local/nvidia-utils-[0-9]*)")"
+  CACHED_VER="${CACHED_VER#nvidia-utils-}"
+  if [[ "$CACHED_VER" != "$DRIVER_VERSION" ]]; then
+    log "Cached build is nvidia $CACHED_VER but $DRIVER_VERSION is pinned — clearing the build overlay"
+    rm -rf "${UPPER:?}" "${OVLWORK:?}"
+    mkdir -p "$UPPER" "$OVLWORK"
+  fi
+fi
+
 log "Setting up overlay build chroot (build residue stays out of the image)"
 # index=off: allows reusing the upperdir even if a lazily-unmounted overlay
 # from an interrupted previous run still references it (enables resume).
@@ -479,6 +560,7 @@ if [[ $UPDATE_MODE == selfheal ]]; then
 # repatch.sh installs the driver from these pinned URLs; to move to a newer
 # driver later, rebuild the USB image with the latest script and reinstall
 # (or update this file by hand with matching-version package URLs).
+DRIVER_SPEC="$DRIVER_SPEC"
 DRIVER_VERSION="$DRIVER_VERSION"
 PKG_URLS="$PKG_URLS"
 EOF
