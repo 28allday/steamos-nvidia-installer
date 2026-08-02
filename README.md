@@ -26,8 +26,8 @@ from Valve is redistributed here.
 
 **The target machine** (where SteamOS will be installed):
 
-- NVIDIA **RTX 20-series or newer** — the open kernel driver only supports
-  Turing and later, so GTX cards will **not** work
+- NVIDIA **GTX 16 / RTX 20-series or newer** — the open kernel driver only supports
+  Turing and later, so GTX 10 series and older will **not** work
 - UEFI boot, **Secure Boot disabled**
 - A USB stick or external drive of **16 GB or more** to flash the installer to
 
