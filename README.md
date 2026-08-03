@@ -2,6 +2,8 @@
 
 **Install real SteamOS on any PC with an NVIDIA RTX graphics card.**
 
+[![steamos-nvidia-installer demo](https://img.youtube.com/vi/S3PcLhEXTK4/maxresdefault.jpg)](https://youtu.be/S3PcLhEXTK4)
+
 Valve's SteamOS recovery image only ships drivers for AMD hardware. This
 script takes the official recovery image and produces a bootable USB
 installer with the NVIDIA driver baked in — including self-healing OS
