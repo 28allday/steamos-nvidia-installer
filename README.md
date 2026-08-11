@@ -154,6 +154,28 @@ Alternative update modes at build time:
 | `--hold-updates` | Steam always reports "up to date" — OS is frozen |
 | `--no-hold-updates` | Stock updates — **an OS update will remove the driver** |
 
+## Updating drivers without rebuilding a new USB image
+
+Rebuilding the USB image (Steps 2–4) always works, but there's a faster way to switch
+driver versions afterward: the
+[decky-nvidia-update](https://github.com/moi952/decky-nvidia-update) Decky Loader plugin
+lets you pick and install any driver version straight from the running system's Quick
+Access menu — no USB stick, no repair image, no reinstall, no reboot until you're actually
+ready for one.
+
+It needs rootfs-A/B grown to 8GiB — Valve's stock 5GiB has no headroom left for a driver
+install (`No space left on device`). You get there one of two ways with this script's USB
+installer:
+
+- **Fresh install** — Step 4's "Install SteamOS (NVIDIA) to Hard Drive" already sizes
+  rootfs-A/B at 8GiB.
+- **Repair an existing install** — booting the USB and choosing "Upgrade SteamOS (NVIDIA)
+  — keeps games & data" prompts a dialog asking whether to grow rootfs-A/B to 8GiB in
+  place (games, saves, and Steam login are untouched either way).
+
+Once the system is on 8GiB partitions, install the plugin and switch driver versions at
+will, without ever touching a USB stick again.
+
 ## All options
 
 ```

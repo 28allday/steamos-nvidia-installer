@@ -74,6 +74,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(realpath -- "$0")")" && pwd)"
+
 # ---------------------------------------------------------------- helpers
 log()  { printf '\e[1;35m[nvidia-usb]\e[0m %s\n' "$*"; }
 warn() { printf '\e[1;33m[warn]\e[0m %s\n' "$*" >&2; }
@@ -875,6 +877,18 @@ if [[ $ADD_INSTALLER -eq 1 ]]; then
     "$TOOLS/repair_device.sh"
   grep -q 'skipping NVMe sanitize' "$TOOLS/repair_device.sh" || die "sanitize patch failed"
   grep -q 'sanitize failed or unsupported' "$TOOLS/repair_device.sh" || die "sanitize-tolerance patch failed"
+
+  # Enlarge rootfs-A/B — see patch_grow_rootfs.sh for the full rationale
+  # (why a physical data relocation is needed, not just resize2fs+sgdisk)
+  # and mechanism. Degrades cleanly with a warning if the companion files
+  # aren't present (curl-only download of just this one script).
+  if [[ -f "$SCRIPT_DIR/patch_grow_rootfs.sh" ]]; then
+    source "$SCRIPT_DIR/patch_grow_rootfs.sh"
+    patch_grow_rootfs
+  else
+    warn "patch_grow_rootfs.sh not found next to this script (curl-only download?) — skipping the rootfs enlarge feature"
+  fi
+  bash -n "$TOOLS/repair_device.sh" || die "patched repair_device.sh has a syntax error"
 
   log "Installing disk-picker wrapper + desktop icons"
   cat > "$TOOLS/install_to_hd.sh" <<'WRAPPER'
