@@ -187,6 +187,25 @@ HTTPS).
 are the clean path. On hybrids the iGPU may own the boot display; results
 vary.
 
+**Screen flickering or artifacts when the cursor is idle** — usually
+adaptive sync (VRR). Try, in order: turn off adaptive sync on the
+monitor/in display settings; disable VRR for the output
+(`kscreen-doctor -o` to find the output ID, then
+`kscreen-doctor output.<ID>.vrrpolicy.never` and reboot); set
+`KWIN_DRM_NO_DIRECT_SCANOUT=1`; or enable developer settings and toggle
+**force composite pipeline**. Lowering Automatic Image Scaling one step
+has also worked. (Community fixes from issue #7.)
+
+**Xbox controller pairs but sticks/buttons do nothing** (rumble and
+battery status work) — the controller firmware is too old for the kernel's
+Bluetooth LE pairing. Connect it to a Windows machine, update its firmware
+in the **Xbox Accessories** app, and pair again. (From issue #12.)
+
+**Steam logged out / games gone after a reflash** — images built before
+the OOBE steam-wrapper fix wiped Steam's data on every boot of the
+installed system until the first OS update. Rebuild with the current
+script; the wipe is disabled at build time.
+
 ## Security note
 
 The installed system ships a passwordless-sudo drop-in for the `deck` user
