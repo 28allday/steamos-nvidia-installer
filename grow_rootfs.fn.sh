@@ -31,8 +31,10 @@
 #      before ever touching the partition table on any mismatch
 #   6. fsck the relocated filesystem at its new physical offset,
 #      independent of the (still old, still correct) partition table
-#   7. only now rewrite the partition table, then fsck once more through
-#      the normal device path to confirm table and data agree
+#   7. only now rewrite the partition table, read it back to confirm home
+#      actually landed where the relocated data was written, then fsck
+#      once more through the normal device path to confirm table and data
+#      agree
 #
 # Interruption: a chunk's source is left untouched only until the PREVIOUS
 # (higher-index) chunk overwrites it — so past the very first chunk,
@@ -51,16 +53,27 @@
 # CURRENT size is, and verifies the result actually reached that size
 # instead of trusting the exit code alone -- "resize max" has been observed
 # to exit 0 without fully taking effect on one slot, cause unconfirmed.
-# Non-fatal on a shortfall (best-effort enlargement, not worth aborting the
-# whole repair over) but always LOUD about it, so a silent no-op like that
-# doesn't go unnoticed again.
+# Non-fatal on ANY failure here (best-effort enlargement, not worth
+# aborting the whole repair over -- a slot that isn't mountable right now
+# for whatever reason was either about to be overwritten anyway or is none
+# of this function's business) but always LOUD about it, so a silent
+# no-op like that doesn't go unnoticed again.
 #   $1 partition device (e.g. /dev/nvme0n1p4)
 _grow_root_slot()
 {
   local slot_dev="$1" slot_mnt part_bytes fs_bytes
   slot_mnt="$(mktemp -d)"
-  cmd mount "$slot_dev" "$slot_mnt" || die "Could not mount $slot_dev to grow its filesystem -- aborting"
-  cmd btrfs filesystem resize max "$slot_mnt" || die "btrfs resize failed on $slot_dev -- aborting"
+  if ! cmd mount "$slot_dev" "$slot_mnt"; then
+    ewarn "Could not mount $slot_dev to grow its filesystem -- skipping (best-effort enlargement, not worth aborting the repair over)"
+    rmdir -- "$slot_mnt"
+    return 0
+  fi
+  if ! cmd btrfs filesystem resize max "$slot_mnt"; then
+    ewarn "btrfs resize failed on $slot_dev -- skipping (best-effort enlargement, not worth aborting the repair over)"
+    cmd umount "$slot_mnt"
+    rmdir -- "$slot_mnt"
+    return 0
+  fi
   part_bytes="$(blockdev --getsize64 "$slot_dev")"
   fs_bytes="$(df -B1 --output=size "$slot_mnt" | tail -1 | tr -d ' ')"
   if (( fs_bytes < part_bytes - 16777216 )); then
@@ -152,7 +165,11 @@ _resume_state_file()
 # Prints the next chunk index to process when a record matches the given
 # disk/geometry; prints nothing if no record exists; dies if a record
 # exists but doesn't match (refuses to guess rather than risk resuming
-# against the wrong disk or a stale geometry).
+# against the wrong disk or a stale geometry). Callers MUST be invoked as
+# `x="$(_resume_state_read ...)" || die ...` -- this function is meant to
+# be called via command substitution, and a die() (exit) taken from
+# inside one only kills that subshell, not the caller, so the caller's
+# own die on a non-zero exit status is what actually stops the run.
 _resume_state_read()
 {
   local disk_guid="$1" home_start_mib="$2" shift_mib="$3" n_chunks="$4"
@@ -249,7 +266,8 @@ maybe_grow_rootfs()
   _assert_relocation_layout "$disk_sector_size" "$cur_root_mib" "$target_mib" "$var_mib" "$home_start_mib" "$shift_mib"
 
   local resume_i=""
-  resume_i="$(_resume_state_read "$disk_guid" "$home_start_mib" "$shift_mib" "$n_chunks")"
+  resume_i="$(_resume_state_read "$disk_guid" "$home_start_mib" "$shift_mib" "$n_chunks")" \
+    || die "Aborting: rootfs-grow resume record check failed (see message above) -- a die() inside a command substitution only kills that subshell, so this second die is what actually stops the run."
 
   local start_i
   if [[ -n "$resume_i" ]]; then
@@ -289,7 +307,7 @@ maybe_grow_rootfs()
 
     local block_size min_blocks min_mib
     block_size="$(dumpe2fs -h "$home_dev" 2>/dev/null | awk -F: '/Block size/{gsub(/ /,"",$2); print $2}')"
-    min_blocks="$(resize2fs -P "$home_dev" 2>&1 | grep -oE '[0-9]+$')"
+    min_blocks="$(resize2fs -P "$home_dev" 2>&1 | tail -1 | grep -oE '[0-9]+$')"
     min_mib=$(( min_blocks * block_size / 1048576 ))
     if (( new_home_mib < min_mib + 2048 )); then
       eerr "Not enough free space on home to grow system partitions safely -- skipping resize."
@@ -335,20 +353,34 @@ maybe_grow_rootfs()
   cmd sgdisk --delete=$FS_ROOT_A --delete=$FS_ROOT_B --delete=$FS_VAR_A --delete=$FS_VAR_B --delete=$FS_HOME "$DISK"
   cmd sgdisk --new=$FS_ROOT_A:0:+${target_mib}MiB --typecode=$FS_ROOT_A:4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709 --change-name=$FS_ROOT_A:rootfs-A --new=$FS_ROOT_B:0:+${target_mib}MiB --typecode=$FS_ROOT_B:4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709 --change-name=$FS_ROOT_B:rootfs-B --new=$FS_VAR_A:0:+${var_mib}MiB --typecode=$FS_VAR_A:4D21B016-B534-45C2-A9FB-5C16E091FD2D --change-name=$FS_VAR_A:var-A --new=$FS_VAR_B:0:+${var_mib}MiB --typecode=$FS_VAR_B:4D21B016-B534-45C2-A9FB-5C16E091FD2D --change-name=$FS_VAR_B:var-B --new=$FS_HOME:0:0 --typecode=$FS_HOME:933AC7E1-2EB4-4F13-B844-0E14E2AEF915 --change-name=$FS_HOME:home "$DISK"
   cmd partprobe "$DISK" || cmd blockdev --rereadpt "$DISK"
+
+  # Confirm the table sgdisk just wrote actually landed home where the
+  # relocated data was written, before the destructive fsck below runs
+  # against it -- on a mismatch, -y is exactly the wrong tool to point at
+  # correctly relocated data sitting at the wrong table offset.
+  estat "Confirming the rewritten table landed where expected"
+  local new_home_start_sector new_home_start_mib
+  new_home_start_sector="$(sgdisk -i "$FS_HOME" "$DISK" | awk '/^First sector:/{print $3}')"
+  [[ "$new_home_start_sector" =~ ^[0-9]+$ ]] \
+    || die "Could not read home partition's start sector after the table rewrite -- system is in an inconsistent state, do not proceed, seek manual recovery"
+  new_home_start_mib=$(( new_home_start_sector * disk_sector_size / 1048576 ))
+  (( new_home_start_mib == home_start_mib + shift_mib )) \
+    || die "Home now starts at ${new_home_start_mib}MiB, expected $(( home_start_mib + shift_mib ))MiB -- the rewritten table does not match where the relocated data actually is; system is in an inconsistent state, do not proceed, seek manual recovery"
+
   _resume_state_clear
 
-  # Same reasoning as the identical block near the top of this function --
-  # needed again here because THIS is the run that actually grows the
-  # partition table for a disk that's never been touched before, so the
-  # earlier (pre-sgdisk) pass only had the OLD, still-small size to work
-  # with. imageroot() separately grows whichever single slot it reimages
-  # this run, but a "system" repair only reimages ONE of rootfs-A/B per
-  # run -- the other would otherwise keep its old, smaller btrfs size.
-  estat "Growing rootfs-A/B filesystems to fill their new partition size"
-  local slot_dev
-  for slot_dev in "$root_a" "$root_b"; do
-    _grow_root_slot "$slot_dev"
-  done
+  # Deliberately NOT re-growing rootfs-A/B's filesystems here: at this
+  # point rootfs-B's new table position is delta_mib into its own OLD
+  # data (home is the only partition whose data is physically relocated),
+  # so mounting it would fail every time. Valve's own repair_steps() always
+  # re-images BOTH rootfs-A and rootfs-B via imageroot() before this
+  # function is reached, and imageroot() already runs its own
+  # 'btrfs filesystem resize max' after each dd -- so growing them again
+  # here is both redundant and, worse, guaranteed to abort on rootfs-B
+  # with no path forward (table already rewritten, home already relocated,
+  # no OS bootable). The pre-sgdisk pass near the top of this function
+  # covers the one legitimate leftover case: an already-grown table whose
+  # filesystem was never grown to match.
 
   estat "Final verification of home through the updated partition table"
   cmd e2fsck -f -y "$home_dev" || die "home failed final verification after the partition table update -- system is in an inconsistent state, do not proceed, seek manual recovery"
