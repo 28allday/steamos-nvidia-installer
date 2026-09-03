@@ -16,14 +16,28 @@ per-game setting. If a game has any 32-bit component (a native 32-bit
 Linux binary, or a 32-bit anti-cheat helper such as EasyAntiCheat's), the
 overlay has to load a 32-bit capsule too.
 
-That capsule depends on `libxkbcommon.so.0`. If `lib32-libxkbcommon`
-isn't installed, the 32-bit overlay injection fails, and — combined with
-anti-cheat's own injection into the same process — that was enough to
-bring Halo MCC down shortly after launching a multiplayer game.
+That capsule has a hard link dependency on `libxkbcommon.so.0`:
 
-Because the overlay is system-wide rather than per-title, **any** game
-with a 32-bit component can hit the same failure, not just the one it was
-first diagnosed on.
+```
+$ readelf -d /usr/lib32/libMangoHud.so | grep NEEDED
+ 0x00000001 (NEEDED)  Shared library: [libxkbcommon.so.0]
+ 0x00000001 (NEEDED)  Shared library: [libwayland-client.so.0]
+ ...
+```
+
+(`libMangoHud_opengl.so` has the same `DT_NEEDED` entry.) But
+`lib32-libxkbcommon` isn't installed anywhere in the shipped image:
+64-bit `libxkbcommon` and `lib32-mangohud` are both present, but
+`lib32-mangohud`'s own `%DEPENDS%` is just `lib32-glibc lib32-gcc-libs
+lib32-dbus lib32-libglvnd` — the dependency is simply missing from
+Valve's package. This isn't a conditional failure that needs anti-cheat
+or any other second factor to tip it over; the preload can never resolve
+on its own, full stop.
+
+Because the overlay is system-wide rather than per-title, and the
+failure is unconditional, **any** game with a 32-bit component hits this
+the moment the gamescope session tries to inject the overlay into it —
+not just Halo MCC, and not only when anti-cheat is in the mix.
 
 ## The fix
 
@@ -48,13 +62,21 @@ routine SteamOS update silently rebuilds `/usr` from stock,
 obvious new cause — until a stable SteamOS release ships with this
 package in the base image by default.
 
-## Persistent workaround
+## Persistent workaround for an existing install
 
-A boot-time systemd service checks for the required packages on every
-boot and silently reinstalls whichever are missing — i.e. whichever a
-prior update just wiped. Both files live under `/etc`, so the
-check-and-reinstall logic itself survives the same updates it's guarding
-against.
+Images built by this repo after the fix landed install `lib32-libxkbcommon`
+into the build chroot itself, from the same frozen `multilib-3.8` mirror
+the driver payload already comes from — so it's captured in the payload
+and registered in the image's pacman db automatically, and simply
+survives A/B updates like everything else this repo installs. If you
+built (or rebuilt) after that change, you don't need anything below this
+point.
+
+If you're on an already-installed system and don't want to rebuild, a
+boot-time systemd service checks for the required package on every boot
+and silently reinstalls it if missing — i.e. if a prior update just wiped
+it. Both files live under `/etc`, so the check-and-reinstall logic itself
+survives the same updates it's guarding against.
 
 `/etc/persist-32bit-libs/reinstall-libs.sh`:
 
@@ -64,7 +86,7 @@ against.
 # Runs on every boot via persist-32bit-libs.service; no-ops if nothing is missing.
 set -euo pipefail
 
-PKGS="lib32-libxkbcommon mangohud lib32-mangohud"
+PKGS="lib32-libxkbcommon"
 MISSING=""
 
 for pkg in $PKGS; do
@@ -80,8 +102,8 @@ fi
 
 echo "persist-32bit-libs: missing$MISSING (likely wiped by a SteamOS update) — reinstalling."
 steamos-readonly disable
+trap 'steamos-readonly enable' EXIT
 pacman -Sy --noconfirm --needed $MISSING
-steamos-readonly enable
 echo "persist-32bit-libs: done."
 ```
 
@@ -89,7 +111,7 @@ echo "persist-32bit-libs: done."
 
 ```ini
 [Unit]
-Description=Reinstall pacman packages wiped by SteamOS system updates (lib32-libxkbcommon, mangohud)
+Description=Reinstall pacman packages wiped by SteamOS system updates (lib32-libxkbcommon)
 After=network-online.target
 Wants=network-online.target
 
@@ -109,7 +131,7 @@ sudo systemctl enable persist-32bit-libs.service
 ```
 
 It runs on every boot — including the one right after an update — and
-puts the packages back before you ever get back into a game.
+puts the package back before you ever get back into a game.
 
 ## Verification
 

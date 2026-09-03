@@ -206,12 +206,13 @@ the OOBE steam-wrapper fix wiped Steam's data on every boot of the
 installed system until the first OS update. Rebuild with the current
 script; the wipe is disabled at build time.
 
-**Games crashing with a SIGSEGV** — Halo MCC (and potentially other games
-with a 32-bit component) would crash because MangoHud's 32-bit overlay failed
-to load: `libxkbcommon.so.0`, a dependency of the 32-bit capsule, isn't included
-in SteamOS. Combined with EasyAntiCheat's own injection, this was crashing the
-game shortly after launch. The fix is to install the missing `lib32-libxkbcommon`
-dependency.
+**Games crashing with a SIGSEGV** — MangoHud's 32-bit overlay
+(`libMangoHud.so`) has a hard `DT_NEEDED` link on `libxkbcommon.so.0`, but
+`lib32-libxkbcommon` isn't in SteamOS's base image or in `lib32-mangohud`'s
+own dependencies, so the 32-bit overlay injection fails outright for any
+game with a 32-bit component — first diagnosed on Halo MCC, not specific
+to it or to anti-cheat. The fix is to install the missing
+`lib32-libxkbcommon` dependency.
 [Full write-up and persistent fix](docs/mangohud-32bit-crash-fix.md).
 
 ## Security note
