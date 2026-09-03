@@ -10,8 +10,12 @@ patch_grow_rootfs()
   # it's the one-time path: run "all" once from this USB and every later
   # "system" repair on that disk inherits the bigger partitions for free,
   # since "system" mode never rewrites the partition table on its own.
-  sed -i -e 's|^PART_SIZE_ROOT="5120"|PART_SIZE_ROOT="8192"|' "$TOOLS/repair_device.sh"
-  grep -q 'PART_SIZE_ROOT="8192"' "$TOOLS/repair_device.sh" || die "rootfs partition-size patch failed"
+  # Bakes in whatever --target-root-mib resolved to at build time (default
+  # 8192, see steamos-nvidia-installer.sh) rather than a hardcoded literal
+  # here -- the "system" repair path's own target_mib gets the identical
+  # treatment further down, so the two can never drift apart.
+  sed -i -e "s|^PART_SIZE_ROOT=\"5120\"|PART_SIZE_ROOT=\"${TARGET_ROOT_MIB}\"|" "$TOOLS/repair_device.sh"
+  grep -q "PART_SIZE_ROOT=\"${TARGET_ROOT_MIB}\"" "$TOOLS/repair_device.sh" || die "rootfs partition-size patch failed"
 
   # btrfs doesn't auto-grow into a larger block device after a raw dd clone
   # (the filesystem stays the source's original size) — grow it to fill
@@ -34,6 +38,8 @@ patch_grow_rootfs()
   fi
 
   cp "$grow_fn" "$TOOLS/.grow_rootfs.fn"
+  sed -i -e "s|^  local target_mib=8192\$|  local target_mib=${TARGET_ROOT_MIB}|" "$TOOLS/.grow_rootfs.fn"
+  grep -q "local target_mib=${TARGET_ROOT_MIB}\$" "$TOOLS/.grow_rootfs.fn" || die "rootfs grow target-size patch failed"
   sed -i '/^  rmdir -- "$mnt"$/,/^}$/{
 /^}$/r '"$TOOLS"'/.grow_rootfs.fn
 }' "$TOOLS/repair_device.sh"

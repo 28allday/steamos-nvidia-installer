@@ -174,19 +174,23 @@ installer:
   place (games, saves, and Steam login are untouched either way).
 
 Once the system is on 8GiB partitions, install the plugin and switch driver versions at
-will, without ever touching a USB stick again.
+will, without ever touching a USB stick again. Want more headroom than 8GiB from the
+start — for multiple driver versions, or bigger NVIDIA userspace payloads down the line?
+Build the USB with `--target-root-mib 12288` (or whatever size you want) instead.
 
 ## All options
 
 ```
---driver SPEC      Driver to install: latest (default), or a branch/version
-                   prefix — 580, 580.105.08, 580.105.08-4.
---hold-updates     Hard-hold OS updates instead of self-healing.
---no-hold-updates  Stock update behaviour (driver lost on update!).
---no-installer     Skip the desktop installer — just a bootable patched OS.
---trim-cuda        Drop CUDA/OpenCL/OptiX libraries (~350 MB smaller).
---skip-sigcheck    Disable pacman signature checks in the build chroot.
---workdir DIR      Build cache location (~3 GB, speeds up reruns).
+--driver SPEC           Driver to install: latest (default), or a branch/version
+                        prefix — 580, 580.105.08, 580.105.08-4.
+--hold-updates          Hard-hold OS updates instead of self-healing.
+--no-hold-updates       Stock update behaviour (driver lost on update!).
+--no-installer          Skip the desktop installer — just a bootable patched OS.
+--trim-cuda             Drop CUDA/OpenCL/OptiX libraries (~350 MB smaller).
+--skip-sigcheck         Disable pacman signature checks in the build chroot.
+--workdir DIR           Build cache location (~3 GB, speeds up reruns).
+--target-root-mib MIB   Size rootfs-A/B are grown to (default 8192 = 8GiB;
+                        Valve ships 5120).
 ```
 
 ## Troubleshooting

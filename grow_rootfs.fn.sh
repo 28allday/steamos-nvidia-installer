@@ -213,6 +213,11 @@ _resume_state_clear()
 
 maybe_grow_rootfs()
 {
+  # Patched in at build time (see patch_grow_rootfs.sh) to whatever
+  # --target-root-mib resolved to, so this and PART_SIZE_ROOT in the
+  # "all"-target's own repair_device.sh can't drift apart. 8192 here is
+  # just this file's own standalone default, for a curl-only download
+  # that never goes through the build script's patching.
   local target_mib=8192
   local var_mib="$PART_SIZE_VAR"
   local root_a root_b home_dev cur_root_mib delta_mib shift_mib

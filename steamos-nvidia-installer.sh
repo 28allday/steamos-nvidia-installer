@@ -65,6 +65,11 @@
 #   --skip-sigcheck    Disable pacman signature checks in the build chroot.
 #   --workdir DIR      Build dir (~3 GB; default: alongside the output).
 #                      Kept between runs — caches the driver build.
+#   --target-root-mib MIB
+#                      Size (MiB) rootfs-A/B are grown to. Default 8192
+#                      (8GiB); Valve ships 5120. Applies to both a fresh
+#                      "all" install and an existing install's "system"
+#                      repair-time grow.
 #
 # Host needs: Arch-ish Linux, losetup, btrfs-progs, rsync, curl, kmod, zstd,
 # python3, readelf (binutils).
@@ -89,6 +94,7 @@ SKIP_SIG=0
 DRIVER_SPEC=latest     # latest | <branch or version prefix, e.g. 580>
 WORKDIR=""
 IMG=""
+TARGET_ROOT_MIB=8192   # MiB per rootfs-A/B slot; Valve ships 5120
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -99,7 +105,8 @@ while [[ $# -gt 0 ]]; do
     --trim-cuda)       TRIM_CUDA=1 ;;
     --skip-sigcheck)   SKIP_SIG=1 ;;
     --workdir)         WORKDIR="${2:?--workdir needs an argument}"; shift ;;
-    -h|--help)         sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --target-root-mib) TARGET_ROOT_MIB="${2:?--target-root-mib needs an argument}"; shift ;;
+    -h|--help)         sed -n '2,78p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)                die "Unknown option: $1" ;;
     *)                 IMG="$1" ;;
   esac
@@ -109,6 +116,8 @@ done
 [[ $EUID -eq 0 ]] || die "Run as root (sudo)."
 [[ "$DRIVER_SPEC" == latest || "$DRIVER_SPEC" =~ ^[0-9]+(\.[0-9]+)*(-[0-9]+)?$ ]] \
   || die "--driver takes 'latest' or a version prefix like 580 / 580.105.08 / 580.105.08-4"
+[[ "$TARGET_ROOT_MIB" =~ ^(0|[1-9][0-9]*)$ ]] \
+  || die "--target-root-mib takes a plain number of MiB with no leading zero, e.g. 8192, 10240, 12288"
 if [[ -z "$IMG" ]]; then
   # No image given — look for exactly one clean repair image next to the script.
   script_dir="$(dirname "$(realpath "$0")")"
