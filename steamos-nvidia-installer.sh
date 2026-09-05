@@ -648,6 +648,16 @@ if [[ "$(btrfs property get "$NEWROOT" ro)" == "ro=true" ]]; then
   WAS_RO=1; btrfs property set "$NEWROOT" ro false
 fi
 
+# Valve's own updater re-images whichever partition set it lands on from
+# its own payload, which resets THAT slot's btrfs filesystem back to its
+# original ~5GiB size even when the underlying GPT partition is bigger
+# (grown by this installer's --target-root-mib, or by a USB repair).
+# Fixing it up here means every future OS update self-heals the size on
+# its own -- no separate Decky plugin required just to keep it correct.
+# Best-effort: never worth failing the driver rebuild over.
+btrfs filesystem resize max "$NEWROOT" \
+  || log "WARNING: could not grow $PARTSET's filesystem to fill its partition (continuing anyway)"
+
 KVER=""
 for d in "$NEWROOT/usr/lib/modules/"*neptune*; do
   [[ -d "$d" ]] && KVER="$(basename "$d")" && break
