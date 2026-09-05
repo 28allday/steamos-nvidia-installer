@@ -138,7 +138,7 @@ _assert_relocation_layout()
         || die "Partition $partnum is $(( end_mib - start_mib ))MiB, expected ${expect_mib[idx]}MiB -- refusing to grow rootfs (unexpected disk layout)"
       prev_end_mib=$end_mib
     fi
-    (( idx++ ))
+    (( ++idx ))
   done
 
   (( home_start_mib_read == home_start_mib )) \
