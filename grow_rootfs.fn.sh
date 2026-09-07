@@ -237,7 +237,15 @@ maybe_grow_rootfs()
   done
 
   cur_root_mib=$(( $(blockdev --getsize64 "$root_a") / 1048576 ))
-  (( cur_root_mib < target_mib )) || return 0
+  if (( cur_root_mib >= target_mib )); then
+    # Already grown -- nothing left for this run to do. Clear any resume
+    # record too: it can only be stale here (this disk is done, whether
+    # because a previous run completed or never needed relocating), and
+    # left behind it would otherwise refuse a later, unrelated disk's grow
+    # with a bogus "doesn't match this disk/geometry" mismatch.
+    _resume_state_clear
+    return 0
+  fi
   delta_mib=$(( target_mib - cur_root_mib ))
   shift_mib=$(( delta_mib * 2 ))
 
@@ -312,7 +320,11 @@ maybe_grow_rootfs()
 
     local block_size min_blocks min_mib
     block_size="$(dumpe2fs -h "$home_dev" 2>/dev/null | awk -F: '/Block size/{gsub(/ /,"",$2); print $2}')"
-    min_blocks="$(resize2fs -P "$home_dev" 2>&1 | tail -1 | grep -oE '[0-9]+$')"
+    [[ "$block_size" =~ ^[0-9]+$ ]] \
+      || die "Could not determine home's block size (unexpected dumpe2fs -h output) -- aborting resize for safety"
+    min_blocks="$(resize2fs -P "$home_dev" 2>&1 | tail -1 | grep -oE '[0-9]+$' || true)"
+    [[ "$min_blocks" =~ ^[0-9]+$ ]] \
+      || die "Could not determine home's minimum resize2fs size (unexpected resize2fs -P output) -- aborting resize for safety"
     min_mib=$(( min_blocks * block_size / 1048576 ))
     if (( new_home_mib < min_mib + 2048 )); then
       eerr "Not enough free space on home to grow system partitions safely -- skipping resize."
@@ -358,6 +370,18 @@ maybe_grow_rootfs()
   cmd sgdisk --delete=$FS_ROOT_A --delete=$FS_ROOT_B --delete=$FS_VAR_A --delete=$FS_VAR_B --delete=$FS_HOME "$DISK"
   cmd sgdisk --new=$FS_ROOT_A:0:+${target_mib}MiB --typecode=$FS_ROOT_A:4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709 --change-name=$FS_ROOT_A:rootfs-A --new=$FS_ROOT_B:0:+${target_mib}MiB --typecode=$FS_ROOT_B:4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709 --change-name=$FS_ROOT_B:rootfs-B --new=$FS_VAR_A:0:+${var_mib}MiB --typecode=$FS_VAR_A:4D21B016-B534-45C2-A9FB-5C16E091FD2D --change-name=$FS_VAR_A:var-A --new=$FS_VAR_B:0:+${var_mib}MiB --typecode=$FS_VAR_B:4D21B016-B534-45C2-A9FB-5C16E091FD2D --change-name=$FS_VAR_B:var-B --new=$FS_HOME:0:0 --typecode=$FS_HOME:933AC7E1-2EB4-4F13-B844-0E14E2AEF915 --change-name=$FS_HOME:home "$DISK"
   cmd partprobe "$DISK" || cmd blockdev --rereadpt "$DISK"
+
+  # partprobe/blockdev --rereadpt can exit 0 while leaving stale in-kernel
+  # partition offsets behind -- the usual outcome when anything still
+  # holds a partition open (_grow_root_slot mounted and unmounted both
+  # root slots moments ago). sgdisk reads the GPT bytes off the disk
+  # directly and says nothing about what the KERNEL thinks the partitions
+  # are, so confirm the kernel's own view of root_a's size actually moved
+  # before trusting anything read through a partition device node (like
+  # home_dev, used below) from here on.
+  estat "Confirming the kernel picked up the rewritten table"
+  (( $(blockdev --getsize64 "$root_a") == target_mib * 1048576 )) \
+    || die "Kernel still reports the old partition size after partprobe -- refusing to continue (reboot and re-run this repair)"
 
   # Confirm the table sgdisk just wrote actually landed home where the
   # relocated data was written, before the destructive fsck below runs

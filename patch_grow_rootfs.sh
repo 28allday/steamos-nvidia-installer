@@ -20,7 +20,10 @@ patch_grow_rootfs()
   # btrfs doesn't auto-grow into a larger block device after a raw dd clone
   # (the filesystem stays the source's original size) — grow it to fill
   # rootfs-A/B now that the partition itself is bigger.
-  sed -i -e '/^imageroot()$/,/^}$/{s|^  cmd btrfs check "$newroot"$|&\n  local mnt; mnt="$(mktemp -d)"\n  cmd mount "$newroot" "$mnt"\n  cmd btrfs filesystem resize max "$mnt"\n  cmd umount "$mnt"\n  rmdir -- "$mnt"|}' \
+  # mktemp -d -p /run rather than the bare (/tmp-default) form: this runs
+  # between Valve's fsfreeze -f / and its matching unfreeze, and /run is a
+  # tmpfs regardless of what /tmp happens to be mounted as on a given image.
+  sed -i -e '/^imageroot()$/,/^}$/{s|^  cmd btrfs check "$newroot"$|&\n  local mnt; mnt="$(mktemp -d -p /run)"\n  cmd mount "$newroot" "$mnt"\n  cmd btrfs filesystem resize max "$mnt"\n  cmd umount "$mnt"\n  rmdir -- "$mnt"|}' \
     "$TOOLS/repair_device.sh"
   grep -q 'btrfs filesystem resize max' "$TOOLS/repair_device.sh" || die "rootfs grow patch failed"
 

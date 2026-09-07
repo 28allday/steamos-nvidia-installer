@@ -154,29 +154,27 @@ Alternative update modes at build time:
 | `--hold-updates` | Steam always reports "up to date" — OS is frozen |
 | `--no-hold-updates` | Stock updates — **an OS update will remove the driver** |
 
-## Updating drivers without rebuilding a new USB image
+## Growing rootfs-A/B (optional, off by default)
 
-Rebuilding the USB image (Steps 2–4) always works, but there's a faster way to switch
-driver versions afterward: the
-[decky-nvidia-update](https://github.com/moi952/decky-nvidia-update) Decky Loader plugin
-lets you pick and install any driver version straight from the running system's Quick
-Access menu — no USB stick, no repair image, no reinstall, no reboot until you're actually
-ready for one.
+Valve ships rootfs-A/B at 5GiB, which "no space left on device"s on pretty much any real
+driver install or update. Pass `--grow-rootfs` when building the USB (or
+`--target-root-mib SIZE`, which implies it) to grow them instead:
 
-It needs rootfs-A/B grown to 8GiB — Valve's stock 5GiB has no headroom left for a driver
-install (`No space left on device`). You get there one of two ways with this script's USB
-installer:
+- **Fresh install** — with `--grow-rootfs`, Step 4's "Install SteamOS (NVIDIA) to Hard
+  Drive" sizes rootfs-A/B at 8GiB (or whatever `--target-root-mib` names) from the start.
+- **Repair an existing install** — booting a USB built with `--grow-rootfs` and choosing
+  "Upgrade SteamOS (NVIDIA) — keeps games & data" prompts a dialog asking whether to grow
+  rootfs-A/B in place (games, saves, and Steam login are untouched either way).
 
-- **Fresh install** — Step 4's "Install SteamOS (NVIDIA) to Hard Drive" already sizes
-  rootfs-A/B at 8GiB.
-- **Repair an existing install** — booting the USB and choosing "Upgrade SteamOS (NVIDIA)
-  — keeps games & data" prompts a dialog asking whether to grow rootfs-A/B to 8GiB in
-  place (games, saves, and Steam login are untouched either way).
+Without either flag, a USB behaves exactly as it always has: Valve's stock 5GiB,
+nothing about `repair_device.sh` touched.
 
-Once the system is on 8GiB partitions, install the plugin and switch driver versions at
-will, without ever touching a USB stick again. Want more headroom than 8GiB from the
-start — for multiple driver versions, or bigger NVIDIA userspace payloads down the line?
-Build the USB with `--target-root-mib 12288` (or whatever size you want) instead.
+The extra room is also what makes
+[decky-nvidia-update](https://github.com/moi952/decky-nvidia-update) practical — a Decky
+Loader plugin that lets you pick and install any driver version straight from the running
+system's Quick Access menu, no USB stick, no repair image, no reinstall, no reboot until
+you're actually ready for one. Once the system has the extra headroom, install the plugin
+and switch driver versions at will, without ever touching a USB stick again.
 
 ## All options
 
@@ -189,8 +187,10 @@ Build the USB with `--target-root-mib 12288` (or whatever size you want) instead
 --trim-cuda             Drop CUDA/OpenCL/OptiX libraries (~350 MB smaller).
 --skip-sigcheck         Disable pacman signature checks in the build chroot.
 --workdir DIR           Build cache location (~3 GB, speeds up reruns).
---target-root-mib MIB   Size rootfs-A/B are grown to (default 8192 = 8GiB;
-                        Valve ships 5120).
+--grow-rootfs           Grow rootfs-A/B beyond Valve's stock 5GiB (off by
+                        default; implied by --target-root-mib).
+--target-root-mib MIB   Size rootfs-A/B are grown to when --grow-rootfs is
+                        active (default 8192 = 8GiB; Valve ships 5120).
 ```
 
 ## Troubleshooting
