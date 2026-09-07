@@ -453,6 +453,21 @@ NVIDIA_VER="$(in_chroot "pacman -Q nvidia-utils" | awk '{print $2}')"
   || die "Chroot has nvidia-utils $NVIDIA_VER but $DRIVER_VERSION was pinned — stale overlay? Delete $WORKDIR and rerun."
 log "Built nvidia-open $NVIDIA_VER for $KVER"
 
+# SteamOS's lib32-mangohud is missing a dependency: /usr/lib32/libMangoHud.so
+# (and libMangoHud_opengl.so) carry a hard DT_NEEDED on libxkbcommon.so.0, but
+# the image ships only the 64-bit libxkbcommon. The gamescope session preloads
+# the overlay system-wide, so any game with a 32-bit component or anti-cheat
+# helper fails the preload — seen as a SIGSEGV a minute or two after launch.
+# Taken from the image's OWN frozen mirror (multilib-3.8.1x carries 1.10.0-1,
+# matching the 64-bit libxkbcommon already installed), so no current-Arch
+# library enters the image. Sits outside the resume branch above so a warm
+# --workdir predating this still picks it up; --needed makes it a no-op after
+# that. Joins the payload automatically via the pacman -Qq diff below.
+log "Installing lib32-libxkbcommon (missing dep of SteamOS's lib32-mangohud)"
+in_chroot "pacman --config $PACCONF -Sy" || warn "pacman -Sy failed — trying the cached db"
+in_chroot "pacman --config $PACCONF -S $PACOPTS lib32-libxkbcommon" \
+  || die "could not install lib32-libxkbcommon from the image's frozen mirror"
+
 # "Before" = the pristine image's own pacman db (read directly, host-side) —
 # NOT the chroot's, whose db carries installs cached in the overlay upper
 # layer from previous runs and would make the diff come out empty.
@@ -683,6 +698,13 @@ in_chroot "pacman -Sy"
 in_chroot "pacman -Qq" | LC_ALL=C sort > "$WORK/before.txt"
 in_chroot "pacman -U --noconfirm --needed /tmp/headers.pkg.tar.zst"
 in_chroot "pacman -S --noconfirm --needed dkms"
+
+# Same missing dependency the build side installs: without lib32-libxkbcommon
+# the gamescope session's 32-bit MangoHud preload fails in every game with a
+# 32-bit component. Non-fatal here — an overlay dependency must never brick an
+# OS update. Lands in the payload via the before/after diff below.
+in_chroot "pacman -S --noconfirm --needed lib32-libxkbcommon" \
+  || log "WARNING: lib32-libxkbcommon install failed — 32-bit MangoHud overlay will not load"
 
 # Driver = the exact pinned Arch packages this image was built with (NOT the
 # slot's frozen repo — that only has Valve's older driver).
