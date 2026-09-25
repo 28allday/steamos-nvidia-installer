@@ -65,6 +65,18 @@
 #   --skip-sigcheck    Disable pacman signature checks in the build chroot.
 #   --workdir DIR      Build dir (~3 GB; default: alongside the output).
 #                      Kept between runs — caches the driver build.
+#   --grow-rootfs      Enlarge rootfs-A/B beyond Valve's stock 5GiB (off by
+#                      default: a USB built without this flag behaves
+#                      exactly like one built without this feature at all —
+#                      PART_SIZE_ROOT stays 5120 and repair_device.sh's
+#                      imageroot() is not touched). Implied by
+#                      --target-root-mib.
+#   --target-root-mib MIB
+#                      Size (MiB) rootfs-A/B are grown to when --grow-rootfs
+#                      (implied by this flag) is active. Default 8192
+#                      (8GiB); Valve ships 5120. Applies to both a fresh
+#                      "all" install and an existing install's "system"
+#                      repair-time grow.
 #
 # Host needs: Arch-ish Linux, losetup, btrfs-progs, rsync, curl, kmod, zstd,
 # python3, readelf (binutils).
@@ -73,6 +85,8 @@
 # Steam setup; if it black-screens: Ctrl+Alt+F3 → steamos-session-select plasma.
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(realpath -- "$0")")" && pwd)"
 
 # ---------------------------------------------------------------- helpers
 log()  { printf '\e[1;35m[nvidia-usb]\e[0m %s\n' "$*"; }
@@ -87,6 +101,8 @@ SKIP_SIG=0
 DRIVER_SPEC=latest     # latest | <branch or version prefix, e.g. 580>
 WORKDIR=""
 IMG=""
+TARGET_ROOT_MIB=8192   # MiB per rootfs-A/B slot; Valve ships 5120
+GROW_ROOTFS=0          # off by default -- --target-root-mib implies it
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -97,7 +113,9 @@ while [[ $# -gt 0 ]]; do
     --trim-cuda)       TRIM_CUDA=1 ;;
     --skip-sigcheck)   SKIP_SIG=1 ;;
     --workdir)         WORKDIR="${2:?--workdir needs an argument}"; shift ;;
-    -h|--help)         sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --grow-rootfs)     GROW_ROOTFS=1 ;;
+    --target-root-mib) TARGET_ROOT_MIB="${2:?--target-root-mib needs an argument}"; GROW_ROOTFS=1; shift ;;
+    -h|--help)         sed -n '2,85p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)                die "Unknown option: $1" ;;
     *)                 IMG="$1" ;;
   esac
@@ -107,6 +125,10 @@ done
 [[ $EUID -eq 0 ]] || die "Run as root (sudo)."
 [[ "$DRIVER_SPEC" == latest || "$DRIVER_SPEC" =~ ^[0-9]+(\.[0-9]+)*(-[0-9]+)?$ ]] \
   || die "--driver takes 'latest' or a version prefix like 580 / 580.105.08 / 580.105.08-4"
+[[ "$TARGET_ROOT_MIB" =~ ^(0|[1-9][0-9]*)$ ]] \
+  || die "--target-root-mib takes a plain number of MiB with no leading zero, e.g. 8192, 10240, 12288"
+(( TARGET_ROOT_MIB >= 5120 )) \
+  || die "--target-root-mib must be at least 5120 (Valve's stock rootfs size) -- got $TARGET_ROOT_MIB"
 if [[ -z "$IMG" ]]; then
   # No image given — look for exactly one clean repair image next to the script.
   script_dir="$(dirname "$(realpath "$0")")"
@@ -652,6 +674,16 @@ if [[ "$(btrfs property get "$NEWROOT" ro)" == "ro=true" ]]; then
   WAS_RO=1; btrfs property set "$NEWROOT" ro false
 fi
 
+# Valve's own updater re-images whichever partition set it lands on from
+# its own payload, which resets THAT slot's btrfs filesystem back to its
+# original ~5GiB size even when the underlying GPT partition is bigger
+# (grown by this installer's --target-root-mib, or by a USB repair).
+# Fixing it up here means every future OS update self-heals the size on
+# its own -- no separate Decky plugin required just to keep it correct.
+# Best-effort: never worth failing the driver rebuild over.
+btrfs filesystem resize max "$NEWROOT" \
+  || log "WARNING: could not grow $PARTSET's filesystem to fill its partition (continuing anyway)"
+
 KVER=""
 for d in "$NEWROOT/usr/lib/modules/"*neptune*; do
   [[ -d "$d" ]] && KVER="$(basename "$d")" && break
@@ -897,6 +929,25 @@ if [[ $ADD_INSTALLER -eq 1 ]]; then
     "$TOOLS/repair_device.sh"
   grep -q 'skipping NVMe sanitize' "$TOOLS/repair_device.sh" || die "sanitize patch failed"
   grep -q 'sanitize failed or unsupported' "$TOOLS/repair_device.sh" || die "sanitize-tolerance patch failed"
+
+  # Enlarge rootfs-A/B — off by default (opt in with --grow-rootfs or
+  # --target-root-mib): a USB built without either flag ends up byte-for-
+  # byte identical here to one built without this feature at all —
+  # PART_SIZE_ROOT stays Valve's stock 5120 and repair_device.sh's
+  # imageroot() is never touched. See patch_grow_rootfs.sh for the full
+  # rationale (why a physical data relocation is needed, not just
+  # resize2fs+sgdisk) and mechanism. Degrades cleanly with a warning if the
+  # companion files aren't present (curl-only download of just this one
+  # script).
+  if (( GROW_ROOTFS )); then
+    if [[ -f "$SCRIPT_DIR/patch_grow_rootfs.sh" ]]; then
+      source "$SCRIPT_DIR/patch_grow_rootfs.sh"
+      patch_grow_rootfs
+    else
+      warn "patch_grow_rootfs.sh not found next to this script (curl-only download?) — skipping the rootfs enlarge feature"
+    fi
+  fi
+  bash -n "$TOOLS/repair_device.sh" || die "patched repair_device.sh has a syntax error"
 
   log "Installing disk-picker wrapper + desktop icons"
   cat > "$TOOLS/install_to_hd.sh" <<'WRAPPER'
