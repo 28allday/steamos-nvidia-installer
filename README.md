@@ -211,9 +211,9 @@ script; the wipe is disabled at build time.
 `lib32-libxkbcommon` isn't in SteamOS's base image or in `lib32-mangohud`'s
 own dependencies, so the 32-bit overlay injection fails outright for any
 game with a 32-bit component — first diagnosed on Halo MCC, not specific
-to it or to anti-cheat. The fix is to install the missing
-`lib32-libxkbcommon` dependency.
-[Full write-up and persistent fix](docs/mangohud-32bit-crash-fix.md).
+to it or to anti-cheat. Images built with the current script include
+`lib32-libxkbcommon` at build time; on an older install, rebuild or follow
+the [full write-up and persistent fix](docs/mangohud-32bit-crash-fix.md).
 
 ## Security note
 
