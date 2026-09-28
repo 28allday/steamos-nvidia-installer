@@ -65,7 +65,8 @@
 #   --skip-sigcheck    Disable pacman signature checks in the build chroot.
 #   --workdir DIR      Build dir (~3 GB; default: alongside the output).
 #                      Kept between runs — caches the driver build.
-#   --grow-rootfs      Enlarge rootfs-A/B beyond Valve's stock 5GiB (off by
+#   --grow-rootfs      EXPERIMENTAL, not maintainer-tested: moves home's data.
+#                      Enlarge rootfs-A/B beyond Valve's stock 5GiB (off by
 #                      default: a USB built without this flag behaves
 #                      exactly like one built without this feature at all —
 #                      PART_SIZE_ROOT stays 5120 and repair_device.sh's
@@ -115,7 +116,7 @@ while [[ $# -gt 0 ]]; do
     --workdir)         WORKDIR="${2:?--workdir needs an argument}"; shift ;;
     --grow-rootfs)     GROW_ROOTFS=1 ;;
     --target-root-mib) TARGET_ROOT_MIB="${2:?--target-root-mib needs an argument}"; GROW_ROOTFS=1; shift ;;
-    -h|--help)         sed -n '2,85p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)         sed -n '2,86p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)                die "Unknown option: $1" ;;
     *)                 IMG="$1" ;;
   esac

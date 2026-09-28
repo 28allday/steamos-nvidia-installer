@@ -154,7 +154,11 @@ Alternative update modes at build time:
 | `--hold-updates` | Steam always reports "up to date" — OS is frozen |
 | `--no-hold-updates` | Stock updates — **an OS update will remove the driver** |
 
-## Growing rootfs-A/B (optional, off by default)
+## Growing rootfs-A/B (experimental, off by default)
+
+> **Experimental.** This moves your home partition's data on disk. It is
+> checksum-verified and asks before it starts, but it has not been tested on
+> the maintainer's hardware. Back up anything you can't lose before using it.
 
 Valve ships rootfs-A/B at 5GiB, which "no space left on device"s on pretty much any real
 driver install or update. Pass `--grow-rootfs` when building the USB (or
