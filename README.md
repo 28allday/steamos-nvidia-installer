@@ -154,17 +154,43 @@ Alternative update modes at build time:
 | `--hold-updates` | Steam always reports "up to date" — OS is frozen |
 | `--no-hold-updates` | Stock updates — **an OS update will remove the driver** |
 
+## Growing rootfs-A/B (optional, off by default)
+
+Valve ships rootfs-A/B at 5GiB, which "no space left on device"s on pretty much any real
+driver install or update. Pass `--grow-rootfs` when building the USB (or
+`--target-root-mib SIZE`, which implies it) to grow them instead:
+
+- **Fresh install** — with `--grow-rootfs`, Step 4's "Install SteamOS (NVIDIA) to Hard
+  Drive" sizes rootfs-A/B at 8GiB (or whatever `--target-root-mib` names) from the start.
+- **Repair an existing install** — booting a USB built with `--grow-rootfs` and choosing
+  "Upgrade SteamOS (NVIDIA) — keeps games & data" prompts a dialog asking whether to grow
+  rootfs-A/B in place (games, saves, and Steam login are untouched either way).
+
+Without either flag, a USB behaves exactly as it always has: Valve's stock 5GiB,
+nothing about `repair_device.sh` touched.
+
+The extra room is also what makes
+[decky-nvidia-update](https://github.com/moi952/decky-nvidia-update) practical — a Decky
+Loader plugin that lets you pick and install any driver version straight from the running
+system's Quick Access menu, no USB stick, no repair image, no reinstall, no reboot until
+you're actually ready for one. Once the system has the extra headroom, install the plugin
+and switch driver versions at will, without ever touching a USB stick again.
+
 ## All options
 
 ```
---driver SPEC      Driver to install: latest (default), or a branch/version
-                   prefix — 580, 580.105.08, 580.105.08-4.
---hold-updates     Hard-hold OS updates instead of self-healing.
---no-hold-updates  Stock update behaviour (driver lost on update!).
---no-installer     Skip the desktop installer — just a bootable patched OS.
---trim-cuda        Drop CUDA/OpenCL/OptiX libraries (~350 MB smaller).
---skip-sigcheck    Disable pacman signature checks in the build chroot.
---workdir DIR      Build cache location (~3 GB, speeds up reruns).
+--driver SPEC           Driver to install: latest (default), or a branch/version
+                        prefix — 580, 580.105.08, 580.105.08-4.
+--hold-updates          Hard-hold OS updates instead of self-healing.
+--no-hold-updates       Stock update behaviour (driver lost on update!).
+--no-installer          Skip the desktop installer — just a bootable patched OS.
+--trim-cuda             Drop CUDA/OpenCL/OptiX libraries (~350 MB smaller).
+--skip-sigcheck         Disable pacman signature checks in the build chroot.
+--workdir DIR           Build cache location (~3 GB, speeds up reruns).
+--grow-rootfs           Grow rootfs-A/B beyond Valve's stock 5GiB (off by
+                        default; implied by --target-root-mib).
+--target-root-mib MIB   Size rootfs-A/B are grown to when --grow-rootfs is
+                        active (default 8192 = 8GiB; Valve ships 5120).
 ```
 
 ## Troubleshooting
