@@ -37,7 +37,10 @@
 #      driver for the new OS (in a chroot on the new slot, from that
 #      version's own repo branch) before the reboot prompt appears. If the
 #      rebuild fails, the update is cancelled and the machine keeps booting
-#      the current working system. Alternatives: --hold-updates makes Steam
+#      the current working system. The wrapper sits on whichever file Steam's
+#      updater resolves to (steamos-update on 3.8, holo-update on 3.9), and
+#      a shutdown guard refuses to switch to a new OS image that has no
+#      driver, whatever path the update took. Alternatives: --hold-updates makes Steam
 #      always report "up to date" (old behaviour), --no-hold-updates leaves
 #      stock update behaviour (an OS update then removes the driver!).
 #   4. Adds the one-click installer: Valve's own repair_device.sh (which
@@ -693,7 +696,15 @@ done
 log "Target kernel: $KVER"
 
 if compgen -G "$NEWROOT/usr/lib/modules/$KVER/updates/dkms/nvidia.ko*" >/dev/null; then
-  log "Driver already present for $KVER — nothing to do"
+  log "Driver already present for $KVER — refreshing the update hooks only"
+  mkdir -p "$NEWROOT/usr/lib/steamos-nvidia"
+  cp -a /usr/lib/steamos-nvidia/. "$NEWROOT/usr/lib/steamos-nvidia/"
+  if HOOKS_OUT="$(/usr/lib/steamos-nvidia/install-hooks.sh "$NEWROOT" 2>&1)"; then
+    log "$HOOKS_OUT"
+  else
+    log "WARNING: could not refresh the update hooks in $PARTSET: $HOOKS_OUT"
+  fi
+  btrfs filesystem sync "$NEWROOT"
   [[ $WAS_RO -eq 1 ]] && btrfs property set "$NEWROOT" ro true
   exit 0
 fi
@@ -800,10 +811,9 @@ grep -q 'rd.driver.blacklist=nouveau' "$NEWROOT/etc/default/grub" \
 # NEXT update is covered too
 mkdir -p "$NEWROOT/usr/lib/steamos-nvidia"
 cp -a /usr/lib/steamos-nvidia/. "$NEWROOT/usr/lib/steamos-nvidia/"
-if [[ ! -f "$NEWROOT/usr/bin/steamos-update.orig" ]]; then
-  mv "$NEWROOT/usr/bin/steamos-update" "$NEWROOT/usr/bin/steamos-update.orig"
-  cp -a /usr/bin/steamos-update "$NEWROOT/usr/bin/steamos-update"
-fi
+HOOKS_OUT="$(/usr/lib/steamos-nvidia/install-hooks.sh "$NEWROOT" 2>&1)" \
+  || die "could not install the update hooks into $PARTSET: $HOOKS_OUT"
+log "$HOOKS_OUT"
 [[ -f "$NEWROOT/usr/lib/systemd/system/steamos-finish-oobe-migration.service" ]] \
   && ln -sf /dev/null "$NEWROOT/etc/systemd/system/steamos-finish-oobe-migration.service"
 [[ -f /etc/sudoers.d/zz-deck-nopasswd ]] \
@@ -828,17 +838,26 @@ log "OK — $PARTSET is NVIDIA-ready ($KVER)"
 REPATCH
   chmod 755 "$MNT/usr/lib/steamos-nvidia/repatch.sh"
 
-  # ---- wrapper around steamos-update: real update, then repatch the new slot
-  if [[ ! -f "$MNT/usr/bin/steamos-update.orig" ]]; then
-    mv "$MNT/usr/bin/steamos-update" "$MNT/usr/bin/steamos-update.orig"
-  fi
-  cat > "$MNT/usr/bin/steamos-update" <<'WRAP'
+  # ---- update wrapper: real update, then repatch the new slot.
+  # Kept as a plain file here; install-hooks.sh puts it over the updater
+  # Steam actually runs (that moved between SteamOS releases, see there).
+  cat > "$MNT/usr/lib/steamos-nvidia/update-wrapper" <<'WRAP'
 #!/bin/bash
-# steamos-update wrapper (steamos-nvidia self-healing updates).
-# Runs Valve's real updater, then rebuilds the NVIDIA driver inside the
-# freshly staged OS slot. If that fails, the update is cancelled: the
-# bootloader keeps booting the current (working) image.
-REAL=/usr/bin/steamos-update.orig
+# steamos-nvidia self-healing update wrapper.
+# Sits on the file Steam's updater resolves to — /usr/bin/steamos-update on
+# SteamOS 3.8, /usr/bin/holo-update on 3.9 (where steamos-update is only a
+# symlink) — with Valve's original beside it as <name>.orig. Runs the real
+# update, then rebuilds the NVIDIA driver inside the freshly staged OS slot.
+# If that fails, the update is cancelled: the bootloader keeps booting the
+# current (working) image.
+SELF="$(readlink -f "$0")"
+REAL="$SELF.orig"
+if [[ ! -x "$REAL" ]]; then
+  for REAL in /usr/bin/holo-update.orig /usr/bin/steamos-update.orig; do
+    [[ -x "$REAL" ]] && break
+  done
+fi
+[[ -x "$REAL" ]] || { echo "steamos-nvidia: Valve's updater (.orig) is missing" >&2; exit 1; }
 REPATCH=/usr/lib/steamos-nvidia/repatch.sh
 LOG=/var/log/steamos-nvidia-repatch.log
 
@@ -850,6 +869,20 @@ done
 "$REAL" "$@"
 rc=$?
 
+this_image() {
+  local bootconf self p
+  for bootconf in steamos-bootconf holo-bootconf; do
+    command -v "$bootconf" >/dev/null && { "$bootconf" this-image 2>/dev/null; return; }
+  done
+  # no bootconf tool: work the booted slot out from the partition links
+  self="$(readlink -f /dev/disk/by-partsets/self/rootfs 2>/dev/null)" || return 1
+  for p in /dev/disk/by-partsets/*/rootfs; do
+    case "$p" in */self/*|*/other/*) continue ;; esac
+    [[ "$(readlink -f "$p")" == "$self" ]] && { basename "$(dirname "$p")"; return; }
+  done
+  return 1
+}
+
 # Edit the boot config of every slot EXCEPT the currently booted one.
 # The conf files on the ESP are plain text; editing them directly is the
 # only revert that reliably steers steamcl (set-mode booted does NOT undo a
@@ -857,7 +890,7 @@ rc=$?
 # boot-attempts is nonzero — both verified the hard way).
 edit_other_confs() {  # args: sed expressions
   local this conf
-  this="$(steamos-bootconf this-image 2>/dev/null)" || return 0
+  this="$(this_image)" || return 0
   [[ -n "$this" ]] || return 0
   for conf in /esp/SteamOS/conf/*.conf; do
     [[ -f "$conf" ]] || continue
@@ -867,7 +900,28 @@ edit_other_confs() {  # args: sed expressions
   sync -f /esp/SteamOS/conf 2>/dev/null || sync
 }
 
+# Valve's updater only returns 0 once the update service reports the new
+# image as written, but check rather than trust it: repatching a slot that
+# is still being written would build into a half-made system.
+update_staged() {
+  local status n=0
+  command -v atomupd-manager >/dev/null || return 0
+  while :; do
+    status="$(atomupd-manager get-update-status 2>/dev/null)" || return 0
+    case "$status" in
+      successful) return 0 ;;
+      in-progress|paused) (( n++ < 720 )) || return 1; sleep 10 ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
 if [[ $rc -eq 0 && $is_apply -eq 1 ]]; then
+  echo "$(date -Is) [wrapper] $SELF $*: update finished, rc=0" >> "$LOG"
+  if ! update_staged; then
+    echo "$(date -Is) [wrapper] update status is '$(atomupd-manager get-update-status 2>/dev/null)', not 'successful' — nothing to repatch" >> "$LOG"
+    exit $rc
+  fi
   echo "Update staged. Building NVIDIA driver for the new OS (10-20 min, do NOT power off)..." >&2
   if "$REPATCH" other >> "$LOG" 2>&1; then
     echo "NVIDIA driver installed into the updated OS. Safe to reboot." >&2
@@ -882,13 +936,155 @@ if [[ $rc -eq 0 && $is_apply -eq 1 ]]; then
       -e 's/^boot-requested-at:.*/boot-requested-at: 0/' \
       -e 's/^boot-attempts:.*/boot-attempts: 0/' \
       -e 's/^image-invalid:.*/image-invalid: 1/'
-    steamos-bootconf set-mode booted 2>/dev/null
+    steamos-bootconf set-mode booted 2>/dev/null || holo-bootconf set-mode booted 2>/dev/null
+    # set-mode booted leaves this image's boot-other set, which would still
+    # switch to the cancelled image on the next boot
+    this="$(this_image)" && [[ -f "/esp/SteamOS/conf/$this.conf" ]] \
+      && sed -i 's/^boot-other:.*/boot-other: 0/' "/esp/SteamOS/conf/$this.conf"
+    sync -f /esp/SteamOS/conf 2>/dev/null || sync
     exit 1
   fi
 fi
 exit $rc
 WRAP
-  chmod 755 "$MNT/usr/bin/steamos-update"
+
+  # ---- shutdown guard: the backstop for any update the wrapper never saw
+  # (an updater Steam calls by another name, Steam's newer D-Bus update path,
+  # a channel switch). At shutdown, if the next boot would switch to an image
+  # without a finished NVIDIA install, it cancels the switch.
+  cat > "$MNT/usr/lib/steamos-nvidia/guard.sh" <<'GUARD'
+#!/bin/bash
+# steamos-nvidia shutdown guard. "hold" keeps /esp and /efi mounted (they are
+# idle-timeout automounts, and the check runs at shutdown); "check" refuses a
+# switch to an image without the NVIDIA driver.
+LOG=/var/log/steamos-nvidia-repatch.log
+log() { echo "[guard] $*"; echo "$(date -Is) [guard] $*" >> "$LOG" 2>/dev/null; }
+
+case "${1:-}" in
+  hold)
+    [[ -d /esp/SteamOS ]] && exec 3</esp
+    [[ -d /efi/EFI ]] && exec 4</efi
+    exec sleep infinity ;;
+  check) ;;
+  *) echo "usage: $0 hold|check" >&2; exit 2 ;;
+esac
+
+BOOTCONF=""
+for b in steamos-bootconf holo-bootconf; do command -v "$b" >/dev/null && { BOOTCONF="$b"; break; }; done
+[[ -n "$BOOTCONF" ]] || { log "no bootconf tool — not checking"; exit 0; }
+this="$("$BOOTCONF" this-image 2>/dev/null)"
+next="$("$BOOTCONF" selected-image 2>/dev/null)"
+[[ -n "$this" && -n "$next" ]] || { log "could not read the boot config — not checking"; exit 0; }
+[[ "$next" == "$this" ]] && exit 0
+
+# Has $next's rootfs got a finished driver install?
+ROOTDEV="/dev/disk/by-partsets/$next/rootfs"
+if [[ ! -b "$ROOTDEV" ]]; then
+  # e.g. 3.9's empty "dev" entry: no OS image of ours to judge
+  log "next boot image '$next' has no partition set — not checking it"
+  exit 0
+fi
+ready=0
+M="$(mktemp -d /run/steamos-nvidia-guard.XXXXXX)"
+if mount -o ro "$ROOTDEV" "$M" 2>/dev/null; then
+  kernels=0; patched=0
+  for d in "$M"/usr/lib/modules/*neptune*; do
+    [[ -f "$d/vmlinuz" ]] || continue
+    kernels=$((kernels+1))
+    # the exact file modules.dep names for nvidia.ko must be there
+    mod="$(grep -m1 -oE '^[^:]*/nvidia\.ko(\.[a-z0-9]+)?:' "$d/modules.dep" 2>/dev/null)"
+    mod="${mod%:}"
+    [[ -n "$mod" && -f "$d/$mod" ]] && patched=$((patched+1))
+  done
+  [[ $kernels -gt 0 && $patched -eq $kernels ]] \
+    && grep -qs '^blacklist nouveau' "$M"/etc/modprobe.d/*.conf \
+    && ready=1
+  umount "$M"
+else
+  log "could not mount $next's rootfs to check it"
+fi
+rmdir "$M" 2>/dev/null
+
+if [[ $ready -eq 1 ]]; then
+  log "next boot switches $this -> $next, which has the NVIDIA driver: allowed"
+  exit 0
+fi
+
+log "next boot would switch $this -> $next, which has no NVIDIA driver: cancelled, staying on $this"
+conf="/esp/SteamOS/conf/$next.conf"
+if [[ -f "$conf" ]]; then
+  sed -i -e 's/^boot-requested-at:.*/boot-requested-at: 0/' \
+         -e 's/^boot-attempts:.*/boot-attempts: 0/' \
+         -e 's/^image-invalid:.*/image-invalid: 1/' "$conf"
+fi
+"$BOOTCONF" set-mode booted 2>/dev/null
+# "boot the other image next time" lives in THIS image's conf as boot-other,
+# and set-mode booted leaves it set — the bootloader then switches anyway.
+"$BOOTCONF" config --image "$this" --set boot-other 0 2>/dev/null \
+  || sed -i 's/^boot-other:.*/boot-other: 0/' "/esp/SteamOS/conf/$this.conf"
+sync -f /esp/SteamOS/conf 2>/dev/null || sync
+exit 0
+GUARD
+
+  # ---- installs the wrapper + guard into a SteamOS root: this image now,
+  # and every newly updated slot later (repatch.sh runs it on the new slot).
+  cat > "$MNT/usr/lib/steamos-nvidia/install-hooks.sh" <<'HOOKS'
+#!/bin/bash
+# install-hooks.sh ROOT — put the steamos-nvidia update wrapper and shutdown
+# guard into the SteamOS root at ROOT ("/" for the running system), using
+# the copies in ROOT/usr/lib/steamos-nvidia.
+set -euo pipefail
+ROOT="${1:?usage: install-hooks.sh ROOT}"
+ROOT="${ROOT%/}"
+LIB=/usr/lib/steamos-nvidia
+for f in update-wrapper guard.sh; do
+  [[ -f "$ROOT$LIB/$f" ]] || { echo "install-hooks: $ROOT$LIB/$f missing" >&2; exit 1; }
+done
+in_root() { if [[ -z "$ROOT" ]]; then "$@"; else chroot "$ROOT" "$@"; fi; }
+is_wrapper() { grep -qs 'steamos-nvidia self-healing' "$1"; }
+
+# Undo the layout older versions left on SteamOS 3.9: the wrapper written
+# over the steamos-update SYMLINK, which Steam no longer calls.
+U="$ROOT/usr/bin/steamos-update"
+if [[ -f "$U" && ! -L "$U" ]] && is_wrapper "$U" && [[ -L "$U.orig" ]]; then
+  mv -f "$U.orig" "$U"
+fi
+
+# The updater Steam runs: steamos-update itself on 3.8; on 3.9 that name is
+# a symlink to holo-update, and Steam's polkit helper execs holo-update.
+TARGET="$(in_root readlink -f /usr/bin/steamos-update)"
+[[ -n "$TARGET" && -f "$ROOT$TARGET" ]] \
+  || { echo "install-hooks: no updater behind /usr/bin/steamos-update" >&2; exit 1; }
+if ! is_wrapper "$ROOT$TARGET"; then
+  mv "$ROOT$TARGET" "$ROOT$TARGET.orig"
+fi
+[[ -f "$ROOT$TARGET.orig" ]] || { echo "install-hooks: $TARGET.orig missing" >&2; exit 1; }
+install -m 755 "$ROOT$LIB/update-wrapper" "$ROOT$TARGET"
+chmod 755 "$ROOT$LIB/guard.sh"
+
+UNIT=steamos-nvidia-guard.service
+cat > "$ROOT/usr/lib/systemd/system/$UNIT" <<'EOF'
+[Unit]
+Description=steamos-nvidia: never boot an OS image without the NVIDIA driver
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/steamos-nvidia/guard.sh hold
+ExecStop=/usr/lib/steamos-nvidia/guard.sh check
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
+EOF
+mkdir -p "$ROOT/usr/lib/systemd/system/multi-user.target.wants"
+ln -sfn "../$UNIT" "$ROOT/usr/lib/systemd/system/multi-user.target.wants/$UNIT"
+echo "install-hooks: wrapper on $TARGET, guard enabled"
+HOOKS
+  chmod 755 "$MNT/usr/lib/steamos-nvidia/update-wrapper" \
+            "$MNT/usr/lib/steamos-nvidia/guard.sh" \
+            "$MNT/usr/lib/steamos-nvidia/install-hooks.sh"
+  "$MNT/usr/lib/steamos-nvidia/install-hooks.sh" "$MNT"
 fi
 
 # ----------------------------------------------------- kernel cmdline
@@ -1060,8 +1256,11 @@ log "Sanity checks"
 compgen -G "$MNT/usr/lib/modules/$KVER/updates/dkms/nvidia.ko*" >/dev/null || die "nvidia.ko missing from image"
 grep -q 'blacklist nouveau' "$MNT/etc/modprobe.d/99-nvidia-patch.conf" || die "modprobe conf is empty/missing"
 if [[ $UPDATE_MODE == selfheal ]]; then
-  grep -q 'self-healing' "$MNT/usr/bin/steamos-update" || die "update wrapper missing"
-  [[ -f "$MNT/usr/bin/steamos-update.orig" ]] || die "original steamos-update not preserved"
+  UPD="$(chroot "$MNT" readlink -f /usr/bin/steamos-update)"
+  grep -q 'steamos-nvidia self-healing' "$MNT$UPD" || die "update wrapper missing from $UPD"
+  [[ -f "$MNT$UPD.orig" ]] || die "Valve's updater not preserved as $UPD.orig"
+  [[ -L "$MNT/usr/lib/systemd/system/multi-user.target.wants/steamos-nvidia-guard.service" ]] \
+    || die "shutdown guard not enabled"
   grep -q 'repatch' "$MNT/usr/lib/steamos-nvidia/repatch.sh" || die "repatch tool missing"
   grep -q "^DRIVER_VERSION=\"$DRIVER_VERSION\"" "$MNT/usr/lib/steamos-nvidia/driver.conf" || die "driver.conf missing/wrong"
   [[ -L "$MNT/etc/systemd/system/atomupd.service" ]] && die "atomupd must NOT be masked in selfheal mode"

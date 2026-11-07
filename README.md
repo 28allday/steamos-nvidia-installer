@@ -140,6 +140,11 @@ automatically rebuilt for the new version before the reboot prompt appears
 the update is cancelled and the machine keeps booting the current working
 system — it fails safe.
 
+As a second safety net, a small service checks at every shutdown: if the
+next boot would switch to an OS version that doesn't have the driver
+(an update that went around the rebuild, say), it cancels the switch and
+the machine boots the current working system again.
+
 To move to a **different driver** later, rebuild the USB image (each run
 re-resolves the driver — latest by default, or whatever `--driver` names)
 and reinstall using the **Upgrade** icon. The installed system stays on the
@@ -208,6 +213,17 @@ to get a desktop for diagnosis.
 **The build says "No repair_device.sh in image home"** — the `.img` you
 fed it isn't the recovery/repair image. Use the recovery image from the
 link in Step 1.
+
+**Black screen after an OS update on SteamOS 3.9** — images built before
+this fix didn't rebuild the driver for updates applied from Steam on 3.9:
+3.9 runs its updater under a new name, so the update went around the
+rebuild (#23). To recover, SSH in (or use another TTY) and, as root, set
+`image-invalid: 1`, `boot-requested-at: 0` and `boot-attempts: 0` in the
+broken slot's `/esp/SteamOS/conf/<A|B>.conf`, then reboot — you're back on
+the version that worked. Don't switch the update channel while you're
+there: that applies the channel's newest image straight away. Then rebuild
+the USB with the current script and reinstall with the **Upgrade** icon
+(keeps your games); updates from Steam are covered again from then on.
 
 **pacman signature errors during the build** — rerun with
 `--skip-sigcheck` (packages come from Valve's and Arch's own servers over
