@@ -573,12 +573,16 @@ chroot "$MNT" systemctl enable nvidia-suspend nvidia-resume nvidia-hibernate 2>/
 # the normal wrapper — and any later reflash brought the wipe back
 # (issue #6). Neutralise just the delete; the wrapper's bootstrap handling
 # is left alone.
-if [[ -f "$MNT/usr/bin/steam" ]] \
-   && grep -q 'rm -rf --one-file-system.*STEAM_LINKS' "$MNT/usr/bin/steam"; then
-  log "Disabling the OOBE steam wrapper's per-boot Steam data wipe"
+# /usr/bin/steam is an ABSOLUTE symlink (to /usr/bin/steam-jupiter on 3.8.14),
+# so resolve it inside the image — testing "$MNT/usr/bin/steam" directly
+# follows the link on the build host and finds nothing.
+STEAM_WRAPPER="$(chroot "$MNT" readlink -f /usr/bin/steam 2>/dev/null || true)"
+if [[ -n "$STEAM_WRAPPER" && -f "$MNT$STEAM_WRAPPER" ]] \
+   && grep -q 'rm -rf --one-file-system.*STEAM_LINKS' "$MNT$STEAM_WRAPPER"; then
+  log "Disabling the OOBE steam wrapper's per-boot Steam data wipe ($STEAM_WRAPPER)"
   sed -i '/rm -rf --one-file-system.*STEAM_LINKS/ s|.*|  : # per-boot Steam data wipe disabled by steamos-nvidia-installer|' \
-    "$MNT/usr/bin/steam"
-  grep -q 'wipe disabled by steamos-nvidia-installer' "$MNT/usr/bin/steam" \
+    "$MNT$STEAM_WRAPPER"
+  grep -q 'wipe disabled by steamos-nvidia-installer' "$MNT$STEAM_WRAPPER" \
     || die "steam wrapper patch failed"
 else
   warn "OOBE steam wrapper wipe not found — skipping (upstream wrapper may have changed)"
