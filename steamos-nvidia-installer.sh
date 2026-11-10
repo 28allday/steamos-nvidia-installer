@@ -563,6 +563,12 @@ EOF
 log "Enabling nvidia suspend/resume services"
 chroot "$MNT" systemctl enable nvidia-suspend nvidia-resume nvidia-hibernate 2>/dev/null \
   || warn "Could not enable nvidia power services (non-fatal)"
+# Dynamic Boost: laptop GPUs (and mobile chips in mini PCs) stay at their base
+# power limit without nvidia-powerd — e.g. an RTX 5080 Laptop GPU held at 100 W
+# instead of the 150 W the platform allows.
+log "Enabling nvidia-powerd (Dynamic Boost)"
+chroot "$MNT" systemctl enable nvidia-powerd 2>/dev/null \
+  || warn "Could not enable nvidia-powerd (non-fatal)"
 
 # ------------------------------------------------- OOBE steam-reset fix
 # The recovery image ships an OOBE build of steam-jupiter whose
@@ -806,6 +812,7 @@ options nvidia-drm modeset=1 fbdev=1
 options nvidia NVreg_PreserveVideoMemoryAllocations=1
 EOF
 chroot "$NEWROOT" systemctl enable nvidia-suspend nvidia-resume nvidia-hibernate 2>/dev/null || true
+chroot "$NEWROOT" systemctl enable nvidia-powerd 2>/dev/null || true
 
 CMDLINE_ADD='rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nvidia-drm.modeset=1 nvidia-drm.fbdev=1'
 grep -q 'rd.driver.blacklist=nouveau' "$NEWROOT/etc/default/grub" \
